@@ -206,11 +206,16 @@ Remarques de conception :
 
 Le zip ne contient **aucun modèle** : seulement le programme et ses
 bibliothèques (PyAV/ffmpeg, CTranslate2, ONNX Runtime, NumPy, Python).
-Estimation à partir des roues Windows officielles : **90 à 130 Mo à
-télécharger**, ~300 Mo une fois décompressé. Le modèle se télécharge au
-premier lancement, une seule fois : 145 Mo pour « Rapide », 480 Mo pour
-« Équilibré ». L'étape « Mesurer le poids du livrable » du workflow affiche
-la taille réelle et les 25 plus gros fichiers, pour savoir quoi alléger.
+Mesuré par la CI : **96 Mo à télécharger**, 255 Mo une fois décompressé. Le
+modèle arrive au premier lancement, une seule fois : 145 Mo pour « Rapide »,
+480 Mo pour « Équilibré ».
+
+Attention en modifiant le workflow : le test de fumée télécharge un modèle
+**dans le dossier de l'exe**, puisque le cache est volontairement placé à côté
+du binaire. Sans l'étape « Nettoyer les traces du test », l'archive publiée
+embarque 140 Mo de modèle de test (353 Mo au lieu de 96). L'étape « Mesurer le
+poids du livrable » affiche la taille réelle et les 25 plus gros fichiers :
+c'est là qu'on voit ce genre de dérive.
 
 Pour publier :
 
@@ -236,12 +241,24 @@ téléchargement sur un dépôt public (2 Go par fichier).
 `modeles` posé à côté de l'exe. Il suffit de copier ce dossier depuis un PC
 où l'application a déjà tourné : aucune connexion n'est alors nécessaire.
 
-**Réduire encore la taille.** Les trois gros postes sont PyAV (~26 Mo,
-ffmpeg), CTranslate2 (~19 Mo, le moteur) et ONNX Runtime (~14 Mo, uniquement
-pour la détection de silence Silero). Supprimer ONNX Runtime impose de passer
-`vad_filter=False`, ce qui dégrade nettement la qualité sur les longs silences
-d'un cours : le jeu n'en vaut pas la chandelle. UPX compresse les DLL mais
-casse régulièrement CTranslate2 et ONNX Runtime — à éviter.
+**Réduire encore la taille.** Les gros postes mesurés, décompressés :
+
+| Fichier | Taille | Remarque |
+|---|---|---|
+| `ctranslate2.dll` | 56,5 Mo | le moteur d'inférence, incompressible |
+| `onnxruntime` (2 fichiers) | 35,8 Mo | uniquement la détection de silence Silero |
+| `av.libs` codecs vidéo | ~35 Mo | libx265, libaom, libvpx, libx264, dav1d |
+| `libscipy_openblas64_.dll` | 19,5 Mo | algèbre linéaire de NumPy |
+| `avcodec-61.dll` | 14,6 Mo | le décodage audio, lui, est indispensable |
+
+Le seul vrai gisement restant, ce sont les **codecs vidéo embarqués par
+PyAV** : l'application ne fait que de l'audio et traîne un encodeur H.265.
+Les supprimer revient à retirer des DLL à l'intérieur du paquet PyAV, qui les
+lie au chargement — à tenter seulement en s'appuyant sur le test de fumée
+pour valider. Supprimer ONNX Runtime imposerait `vad_filter=False`, ce qui
+dégrade nettement la qualité sur les longs silences d'un cours : le jeu n'en
+vaut pas la chandelle. UPX compresse les DLL mais casse régulièrement
+CTranslate2 et ONNX Runtime — à éviter.
 
 ### Tests
 
