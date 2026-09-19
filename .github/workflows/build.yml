@@ -32,7 +32,7 @@ jobs:
           if ($LASTEXITCODE) { throw "Mise a jour de pip echouee" }
           pip install -r requirements.txt
           if ($LASTEXITCODE) { throw "Installation des dependances echouee" }
-          pip install pyinstaller==6.11.1
+          pip install pyinstaller==6.22.3
           if ($LASTEXITCODE) { throw "Installation de PyInstaller echouee" }
 
       # Garde-fou : si une dependance native manque, on le sait ici et pas
@@ -60,6 +60,7 @@ jobs:
             --add-data "version.txt;." `
             --name Transcripteur `
             --add-data "ui;ui" `
+            --collect-all numpy `
             --collect-all faster_whisper `
             --collect-all ctranslate2 `
             --collect-all av `

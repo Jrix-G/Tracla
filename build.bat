@@ -41,7 +41,7 @@ rem --- 3. Dependances ------------------------------------------------------
 echo [3/5] Installation des dependances (quelques minutes la premiere fois)...
 "%VPY%" -m pip install --upgrade pip --quiet || goto :erreur
 "%VPY%" -m pip install -r requirements.txt --quiet || goto :erreur
-"%VPY%" -m pip install pyinstaller==6.11.1 --quiet || goto :erreur
+"%VPY%" -m pip install pyinstaller==6.22.3 --quiet || goto :erreur
 
 rem --- 4. Nettoyage --------------------------------------------------------
 echo [4/5] Nettoyage des constructions precedentes...
@@ -58,6 +58,7 @@ echo [5/5] Construction de l'executable...
   --name Transcripteur ^
   --add-data "ui;ui" ^
   --add-data "version.txt;." ^
+  --collect-all numpy ^
   --collect-all faster_whisper ^
   --collect-all ctranslate2 ^
   --collect-all av ^
