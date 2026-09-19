@@ -21,7 +21,14 @@ L'audio ne quitte jamais la machine.
 
 **Au premier lancement seulement**, l'application télécharge le modèle de
 transcription (une barre de progression s'affiche). Ensuite elle fonctionne
-totalement hors ligne.
+totalement hors ligne. Si tu changes de qualité plus tard, le nouveau modèle
+se télécharge à ce moment-là, une seule fois lui aussi.
+
+**Mises à jour.** Quand une nouvelle version existe, un bandeau apparaît en
+haut de la page. Un clic sur « Mettre à jour » télécharge, installe et relance
+l'application toute seule — les modèles déjà téléchargés sont conservés, il n'y
+a rien à retélécharger. Tu peux couper ces vérifications avec la case
+« Me prévenir des nouvelles versions », en bas de l'écran d'accueil.
 
 **Si Windows affiche « Windows a protégé votre ordinateur »** : c'est normal,
 le programme n'est pas signé numériquement (une signature coûte plusieurs
@@ -156,6 +163,45 @@ hésitations, `small` pour des mots plus justes mais un discours lissé.** C'est
 pour ça que la case « Garder les hésitations » est cochée par défaut et que le
 texte de l'option ne promet pas plus que ce qui est observé.
 
+### Mise à jour automatique
+
+L'exe embarque son numéro de version (`version.txt`, écrit par la CI à partir
+du tag). Au démarrage, un thread interroge
+`api.github.com/repos/<dépôt>/releases/latest` — **une requête GET anonyme,
+rien n'est envoyé**, et l'échec est silencieux si la machine est hors ligne.
+Si le tag distant est supérieur, un bandeau s'affiche.
+
+Le bouton « Mettre à jour » télécharge le zip de la release (progression
+diffusée dans le flux SSE existant), le décompresse dans `%TEMP%`, écrit un
+script `.bat` et le lance détaché. Ce script :
+
+1. attend la fermeture complète de l'application (sinon Windows garde les
+   fichiers verrouillés et la copie échoue) ;
+2. copie les nouveaux fichiers **par-dessus** les anciens avec
+   `robocopy /E` — sans `/PURGE`, donc **`modeles` et `reglages.json` ne sont
+   jamais supprimés** : pas de re-téléchargement de 480 Mo après chaque mise
+   à jour ;
+3. relance `Transcripteur.exe`, qui rouvre le navigateur sur un nouvel onglet
+   (le port est retiré au hasard à chaque démarrage, l'ancien onglet ne peut
+   donc pas se reconnecter — l'écran le dit).
+
+Si la copie échoue, le script laisse une fenêtre ouverte avec la marche à
+suivre, et **l'ancienne version reste fonctionnelle** : rien n'est supprimé
+avant que la nouvelle ne soit en place.
+
+Un build local (`build.bat`) inscrit `dev` comme version : la vérification est
+alors désactivée, pour ne pas proposer de « mettre à jour » une version de
+travail vers une release plus ancienne.
+
+Remarques de conception :
+
+- la vérification est la **seule** connexion sortante de l'application en
+  dehors du téléchargement des modèles, et elle est coupable en un clic ;
+- pas de signature ni de somme de contrôle : l'archive vient de GitHub en
+  HTTPS et la chaîne de confiance s'arrête là. Signer l'exe coûte plusieurs
+  centaines d'euros par an, ce qui n'a pas de sens ici ;
+- la mise à jour est refusée si une transcription est en cours.
+
 ### Publier une version
 
 Le zip ne contient **aucun modèle** : seulement le programme et ses
@@ -175,6 +221,11 @@ git remote add origin https://github.com/<toi>/transcripteur.git
 git push -u origin main          # la CI construit et teste l'exe
 git tag v1.0.0 && git push --tags # la CI publie la Release
 ```
+
+Pour les versions suivantes, il suffit de pousser un tag plus grand
+(`v1.1.0`) : les utilisateurs de `v1.0.0` verront le bandeau au lancement
+suivant. **Le numéro doit rester au format `vX.Y.Z`** — c'est ce que compare
+l'application.
 
 Le lien à donner est alors
 `https://github.com/<toi>/transcripteur/releases/latest` : une page, un

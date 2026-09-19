@@ -72,6 +72,29 @@ button, select, textarea, input { font: inherit; color: inherit; }
 .aide { display: block; color: var(--gris); font-size: .8125rem; margin-top: .25rem; }
 code { font-family: var(--mono); font-size: .8125rem; }
 
+/* --------------------------- Mise à jour --------------------------- */
+
+/* Un bandeau sobre en haut de page : il informe, il ne s'impose pas.
+   Il utilise la couleur d'accent, pas une couleur d'alerte : une nouvelle
+   version n'est pas un problème. */
+.bandeau {
+  display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+  background: var(--accent-fond);
+  border-bottom: 1px solid var(--trait);
+  padding: .7rem 1rem;
+}
+.bandeau-texte { margin: 0; display: flex; gap: .5rem; align-items: baseline; flex-wrap: wrap; }
+.bandeau-actions { margin-left: auto; display: flex; gap: .75rem; align-items: center; }
+.bandeau .barre { flex-basis: 100%; margin-top: .2rem; }
+.principal.compact { width: auto; padding: .35rem .8rem; font-size: .875rem; }
+
+.pied-version {
+  display: flex; gap: 1rem; align-items: center; flex-wrap: wrap;
+  border-top: 1px solid var(--trait); padding-top: .8rem; margin-top: 1.2rem;
+}
+.case-maj { display: flex; gap: .4rem; align-items: center; cursor: pointer; }
+.case-maj input { accent-color: var(--accent); }
+
 /* ----------------------------- Accueil ----------------------------- */
 
 #accueil {

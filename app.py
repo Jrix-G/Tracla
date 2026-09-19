@@ -55,7 +55,10 @@ import socket
 import tempfile
 import threading
 import time
+import subprocess
 import unicodedata
+import urllib.error
+import urllib.request
 import webbrowser
 from queue import Queue, Empty
 from urllib.parse import unquote
@@ -83,6 +86,11 @@ MODELS = {
 EXTS_OK = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac", ".wma",
            ".mp4", ".mkv", ".webm"}
 
+# Mise a jour : depot public consulte pour connaitre la derniere version.
+DEPOT = "Jrix-G/Tracla"
+NOM_ZIP = "Transcripteur-windows.zip"
+API_RELEASES = "https://api.github.com/repos/%s/releases/latest" % DEPOT
+
 # Conteneurs / codecs que les navigateurs ne lisent pas : on transcode.
 CODECS_NAVIGATEUR = {"mp3", "aac", "opus", "vorbis", "flac",
                      "pcm_s16le", "pcm_s24le", "pcm_f32le"}
@@ -107,6 +115,52 @@ PROMPT_HESITATIONS = ("Euh, alors, ben, voila, du coup... euh, bon. "
 # ---------------------------------------------------------------------------
 # Utilitaires
 # ---------------------------------------------------------------------------
+
+def version_app():
+    """Version du build. La CI ecrit version.txt au moment de construire l'exe ;
+    sans ce fichier on est en developpement et la mise a jour est desactivee."""
+    for base in (app_dir(), resource_path("")):
+        chemin = os.path.join(base, "version.txt")
+        if os.path.isfile(chemin):
+            try:
+                v = open(chemin, encoding="utf-8").read().strip()
+                if re.fullmatch(r"v?\d+\.\d+\.\d+", v or ""):
+                    return v if v.startswith("v") else "v" + v
+            except Exception:
+                pass
+    return "dev"
+
+
+VERSION = version_app()
+
+
+def numero(v):
+    """'v1.2.3' -> (1, 2, 3). None si ce n'est pas une version publiee."""
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", (v or "").strip())
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+FICHIER_REGLAGES = os.path.join(app_dir(), "reglages.json")
+
+
+def lire_reglages():
+    try:
+        with open(FICHIER_REGLAGES, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def ecrire_reglage(cle, valeur):
+    r = lire_reglages()
+    r[cle] = valeur
+    try:
+        with open(FICHIER_REGLAGES, "w", encoding="utf-8") as f:
+            json.dump(r, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return r
+
 
 def documents_dir():
     """Dossier Documents de l'utilisateur (Windows, avec repli Linux/macOS)."""
@@ -295,6 +349,168 @@ def est_hallucination(texte, no_speech_prob):
     if not n:
         return True
     return bool(JUNK_RE.match(n)) and no_speech_prob > 0.5
+
+
+# ---------------------------------------------------------------------------
+# Mise a jour
+# ---------------------------------------------------------------------------
+
+# Ce que l'on sait de la derniere version publiee. Rempli par un thread au
+# demarrage, puis a la demande.
+MAJ = {"verifie": False, "disponible": None, "erreur": None}
+
+
+def maj_activee():
+    return bool(lire_reglages().get("maj_auto", True))
+
+
+def chercher_maj():
+    """Interroge la page des releases du depot. Ne transmet rien d'autre
+    qu'une requete GET anonyme : aucune donnee de l'utilisateur ne part."""
+    if numero(VERSION) is None:          # build de developpement
+        MAJ.update(verifie=True, disponible=None,
+                   erreur="Version de developpement : mise a jour desactivee.")
+        return MAJ
+    if not maj_activee():
+        MAJ.update(verifie=True, disponible=None, erreur=None)
+        return MAJ
+    try:
+        req = urllib.request.Request(API_RELEASES, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Transcripteur/%s" % VERSION})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            info = json.load(r)
+    except urllib.error.HTTPError as e:
+        # 404 = le depot n'a encore aucune release : ce n'est pas une erreur.
+        MAJ.update(verifie=True, disponible=None,
+                   erreur=None if e.code == 404 else
+                   "GitHub a repondu %s." % e.code)
+        return MAJ
+    except Exception:
+        MAJ.update(verifie=True, disponible=None,
+                   erreur="Verification impossible (pas de connexion).")
+        return MAJ
+
+    tag = info.get("tag_name") or ""
+    actuel, distant = numero(VERSION), numero(tag)
+    zip_url, taille = None, 0
+    for a in info.get("assets") or []:
+        if a.get("name") == NOM_ZIP:
+            zip_url = a.get("browser_download_url")
+            taille = a.get("size") or 0
+    if distant and actuel and distant > actuel and zip_url:
+        MAJ.update(verifie=True, erreur=None, disponible={
+            "version": tag, "url": zip_url, "taille": taille,
+            "notes": (info.get("body") or "").strip()[:1500]})
+    else:
+        MAJ.update(verifie=True, disponible=None, erreur=None)
+    return MAJ
+
+
+def installer_maj():
+    """Telecharge la nouvelle version, la decompresse, puis passe la main a un
+    script qui attend la fermeture de l'application, remplace les fichiers et
+    la relance. Le dossier 'modeles' n'est jamais touche : on copie par-dessus,
+    on n'efface rien."""
+    dispo = MAJ.get("disponible")
+    if not dispo:
+        raise RuntimeError("Aucune mise a jour disponible.")
+    if os.name != "nt":
+        raise RuntimeError("La mise a jour automatique n'existe que sous "
+                           "Windows. Sous Linux, relance depuis les sources.")
+
+    travail = os.path.join(tempfile.gettempdir(), "transcripteur-maj")
+    shutil.rmtree(travail, ignore_errors=True)
+    os.makedirs(travail, exist_ok=True)
+    archive = os.path.join(travail, NOM_ZIP)
+
+    JOB.emettre("maj", {"etape": "telechargement", "pct": 0}, durable=False)
+    req = urllib.request.Request(dispo["url"], headers={
+        "User-Agent": "Transcripteur/%s" % VERSION})
+    with urllib.request.urlopen(req, timeout=60) as r, open(archive, "wb") as f:
+        total = int(r.headers.get("Content-Length") or dispo["taille"] or 0)
+        recu, dernier = 0, -1
+        while True:
+            bloc_ = r.read(256 * 1024)
+            if not bloc_:
+                break
+            f.write(bloc_)
+            recu += len(bloc_)
+            pct = int(100 * recu / total) if total else 0
+            if pct != dernier:
+                dernier = pct
+                JOB.emettre("maj", {"etape": "telechargement", "pct": pct},
+                            durable=False)
+
+    JOB.emettre("maj", {"etape": "extraction", "pct": 100}, durable=False)
+    extrait = os.path.join(travail, "extrait")
+    import zipfile
+    with zipfile.ZipFile(archive) as z:
+        z.extractall(extrait)
+    os.remove(archive)
+
+    # Le zip contient un dossier Transcripteur/ ; on accepte aussi une archive
+    # dont les fichiers sont a la racine.
+    source = os.path.join(extrait, "Transcripteur")
+    if not os.path.isfile(os.path.join(source, "Transcripteur.exe")):
+        source = extrait
+    if not os.path.isfile(os.path.join(source, "Transcripteur.exe")):
+        raise RuntimeError("L'archive telechargee ne contient pas "
+                           "Transcripteur.exe.")
+
+    script = os.path.join(tempfile.gettempdir(), "transcripteur-maj.bat")
+    with open(script, "w", encoding="cp1252", errors="replace") as f:
+        f.write(SCRIPT_MAJ % {
+            "pid": os.getpid(),
+            "source": source,
+            "cible": app_dir(),
+            "travail": travail,
+        })
+
+    JOB.emettre("maj", {"etape": "redemarrage", "pct": 100}, durable=False)
+    # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP : le script survit a l'arret
+    # de l'application.
+    subprocess.Popen(["cmd", "/c", script], close_fds=True,
+                     creationflags=0x00000008 | 0x00000200)
+    threading.Timer(1.2, _arreter).start()
+
+
+SCRIPT_MAJ = """@echo off
+chcp 65001 >nul
+title Mise a jour du Transcripteur
+echo Mise a jour en cours, ne ferme pas cette fenetre...
+
+rem Attendre que l'application soit vraiment fermee (sinon les fichiers sont
+rem verrouilles par Windows et la copie echoue).
+set TENTATIVES=0
+:attendre
+tasklist /FI "PID eq %(pid)d" 2>nul | find "%(pid)d" >nul
+if errorlevel 1 goto copier
+set /a TENTATIVES+=1
+if %%TENTATIVES%% GTR 60 goto echec
+timeout /t 1 /nobreak >nul
+goto attendre
+
+:copier
+rem /E copie sans effacer : le dossier "modeles" (plusieurs centaines de Mo)
+rem et les reglages sont conserves.
+robocopy "%(source)s" "%(cible)s" /E /NFL /NDL /NJH /NJS /NP /R:3 /W:1 >nul
+if errorlevel 8 goto echec
+
+start "" "%(cible)s\\Transcripteur.exe"
+rmdir /s /q "%(travail)s" 2>nul
+exit /b 0
+
+:echec
+echo.
+echo La mise a jour n'a pas pu etre installee.
+echo Relance Transcripteur.exe : l'ancienne version fonctionne toujours.
+echo Tu peux aussi telecharger la derniere version a la main sur
+echo https://github.com/%(depot)s/releases/latest
+echo.
+pause
+exit /b 1
+""".replace("%(depot)s", DEPOT)
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +834,8 @@ def config():
         "nom": JOB.nom,
         "duree": JOB.duree,
         "job": JOB.id,
+        "version": VERSION,
+        "depot": DEPOT,
     })
 
 
@@ -797,6 +1015,53 @@ def texte():
     return Response(corps, mimetype="text/plain; charset=utf-8")
 
 
+@app.get("/api/version")
+def version_route():
+    return jsonify({
+        "version": VERSION,
+        "depot": DEPOT,
+        "maj_auto": maj_activee(),
+        "verifie": MAJ["verifie"],
+        "disponible": MAJ["disponible"],
+        "erreur": MAJ["erreur"],
+        "installable": os.name == "nt",
+    })
+
+
+@app.post("/api/maj/verifier")
+def maj_verifier():
+    return jsonify(chercher_maj())
+
+
+@app.post("/api/maj/reglage")
+def maj_reglage():
+    actif = bool((request.get_json(force=True, silent=True) or {}).get("actif"))
+    ecrire_reglage("maj_auto", actif)
+    if not actif:
+        MAJ.update(disponible=None)
+    return jsonify({"maj_auto": actif})
+
+
+@app.post("/api/maj/installer")
+def maj_installer():
+    if JOB.etat in ("modele", "transcription"):
+        return jsonify({"erreur": "Une transcription est en cours. Arrete-la "
+                                  "avant de mettre a jour."}), 409
+    try:
+        threading.Thread(target=_installer_en_fond, daemon=True).start()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"erreur": str(e)}), 500
+
+
+def _installer_en_fond():
+    try:
+        installer_maj()
+    except Exception as e:
+        JOB.emettre("maj", {"etape": "erreur", "message": str(e)},
+                    durable=False)
+
+
 @app.post("/api/quitter")
 def quitter():
     JOB.stop.set()
@@ -854,7 +1119,7 @@ def main():
     url = "http://127.0.0.1:%d/" % port
 
     print("=" * 58, flush=True)
-    print(" Transcripteur - transcription locale de cours audio")
+    print(" Transcripteur %s - transcription locale de cours audio" % VERSION)
     print("=" * 58)
     print(" Interface : %s" % url)
     print(" Modeles   : %s" % MODELS_DIR)
@@ -864,6 +1129,9 @@ def main():
 
     if os.environ.get("TRANSCRIPTEUR_SANS_NAVIGATEUR") != "1":
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    # Verification de version en tache de fond : une requete GET anonyme vers
+    # GitHub, jamais bloquante, silencieuse si pas d'Internet.
+    threading.Thread(target=chercher_maj, daemon=True).start()
     from waitress import serve
     try:
         serve(app, host="127.0.0.1", port=port, threads=12,

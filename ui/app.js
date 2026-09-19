@@ -225,6 +225,7 @@ function traiter(e) {
       $("#etat-lecture").hidden = true;
       break;
     case "fichier": etat.fichier = e.chemin; break;
+    case "maj": maj_progression(e); break;
     case "etat": maj_etat(e); break;
   }
 }
@@ -501,3 +502,105 @@ $("#nouvelle").addEventListener("click", () => {
       !confirm("Une transcription est en cours. L'arrêter et en démarrer une autre ?")) return;
   fetch("/api/stop", { method: "POST" }).then(() => location.reload());
 });
+
+
+/* ---------------------------- Mise à jour ----------------------------
+   Une seule requête sortante : GET sur la page des releases du dépôt, pour
+   comparer les numéros de version. Aucune donnée n'est envoyée, et la case
+   « Me prévenir des nouvelles versions » coupe complètement la vérification. */
+
+const bandeau = $("#bandeau-maj");
+
+function afficher_version(v) {
+  $("#version").textContent = "Transcripteur " + (v.version === "dev"
+    ? "(version de développement)" : v.version);
+  $("#maj-auto").checked = v.maj_auto;
+  $("#maj-verifier").hidden = !v.maj_auto || v.version === "dev";
+
+  if (!v.disponible) { bandeau.hidden = true; return; }
+  etat.maj = v.disponible;
+  $("#maj-titre").textContent = "Version " + v.disponible.version + " disponible";
+  $("#maj-detail").textContent = v.installable
+    ? "Mise à jour en un clic. Tes modèles déjà téléchargés sont conservés."
+    : "Télécharge-la depuis la page des versions du projet.";
+  $("#maj-installer").hidden = !v.installable;
+  bandeau.hidden = false;
+}
+
+fetch("/api/version").then((r) => r.json()).then(afficher_version).catch(() => {});
+
+$("#maj-auto").addEventListener("change", (e) => {
+  fetch("/api/maj/reglage", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ actif: e.target.checked }),
+  }).then(() => fetch("/api/version").then((r) => r.json()).then(afficher_version));
+});
+
+$("#maj-verifier").addEventListener("click", () => {
+  $("#maj-verifier").textContent = "Vérification…";
+  fetch("/api/maj/verifier", { method: "POST" })
+    .then((r) => r.json())
+    .then((m) => {
+      $("#maj-verifier").textContent = "Vérifier maintenant";
+      if (m.disponible) return fetch("/api/version").then((r) => r.json()).then(afficher_version);
+      toast(m.erreur || "Tu as déjà la dernière version.");
+    })
+    .catch(() => {
+      $("#maj-verifier").textContent = "Vérifier maintenant";
+      toast("Vérification impossible : pas de connexion.");
+    });
+});
+
+$("#maj-plus-tard").addEventListener("click", () => { bandeau.hidden = true; });
+
+$("#maj-installer").addEventListener("click", () => {
+  if (["modele", "transcription"].includes(etat.phase) &&
+      !confirm("Une transcription est en cours. La mise à jour va l'arrêter. " +
+               "Continuer ?")) return;
+  $("#maj-installer").disabled = true;
+  $("#maj-plus-tard").hidden = true;
+  $("#maj-barre").hidden = false;
+  $("#maj-titre").textContent = "Mise à jour en cours";
+  $("#maj-detail").textContent = "Ne ferme pas la fenêtre.";
+  // Le flux SSE peut ne pas être branché (écran d'accueil) : on l'ouvre.
+  if (!etat.source) brancher_flux();
+  fetch("/api/maj/installer", { method: "POST" })
+    .then((r) => r.json())
+    .then((r) => { if (r.erreur) echec_maj(r.erreur); })
+    .catch(() => echec_maj("La mise à jour n'a pas pu démarrer."));
+});
+
+function maj_progression(e) {
+  const barre = $("#maj-barre").firstElementChild;
+  if (e.etape === "telechargement") {
+    $("#maj-titre").textContent = "Téléchargement de la nouvelle version";
+    $("#maj-detail").textContent = e.pct + " %";
+    barre.style.width = e.pct + "%";
+  } else if (e.etape === "extraction") {
+    $("#maj-titre").textContent = "Installation";
+    $("#maj-detail").textContent = "Décompression des fichiers…";
+    barre.style.width = "100%";
+  } else if (e.etape === "redemarrage") {
+    $("#maj-titre").textContent = "Redémarrage";
+    $("#maj-detail").textContent = "";
+    if (etat.source) etat.source.close();
+    document.body.innerHTML =
+      '<main id="accueil" class="page"><header class="entete-accueil">' +
+      '<h1>Mise à jour en cours</h1><p class="sous-titre">Le Transcripteur ' +
+      'se ferme, se met à jour et rouvre une nouvelle page tout seul. ' +
+      'Ça prend quelques secondes. Tu peux fermer cet onglet.</p>' +
+      '</header></main>';
+  } else if (e.etape === "erreur") {
+    echec_maj(e.message);
+  }
+}
+
+function echec_maj(message) {
+  $("#maj-barre").hidden = true;
+  $("#maj-installer").disabled = false;
+  $("#maj-plus-tard").hidden = false;
+  $("#maj-titre").textContent = "La mise à jour a échoué";
+  $("#maj-detail").textContent = message +
+    " L\u2019application actuelle continue de fonctionner normalement.";
+}

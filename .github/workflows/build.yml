@@ -27,9 +27,20 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller==6.11.1
 
+      # Sur un tag v1.2.3, la version est embarquee dans l'exe : c'est elle
+      # que l'application compare a la derniere release publiee. Sur une
+      # branche, on ecrit "dev" et la mise a jour reste desactivee.
+      - name: Inscrire le numéro de version
+        shell: pwsh
+        run: |
+          $v = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME } else { 'dev' }
+          Set-Content -Path version.txt -Value $v -NoNewline -Encoding utf8
+          "Version embarquée : $v"
+
       - name: Construire l'exécutable
         run: |
           pyinstaller --noconfirm --clean --onedir --console `
+            --add-data "version.txt;." `
             --name Transcripteur `
             --add-data "ui;ui" `
             --collect-all faster_whisper `
@@ -52,9 +63,13 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
 
+      # Meme si le test de fumee echoue, on veut connaitre le poids et garder
+      # la sortie de l'exe : c'est ce qui permet de diagnostiquer.
       - name: Mesurer le poids du livrable
+        if: always()
         shell: pwsh
         run: |
+          if (-not (Test-Path dist/Transcripteur)) { "Pas de dossier dist."; exit 0 }
           $brut = (Get-ChildItem -Recurse dist/Transcripteur | Measure-Object -Property Length -Sum).Sum
           Compress-Archive -Path dist/Transcripteur -DestinationPath Transcripteur-windows.zip -CompressionLevel Optimal
           $zip = (Get-Item Transcripteur-windows.zip).Length
@@ -66,11 +81,24 @@ jobs:
             Sort-Object Length -Descending | Select-Object -First 25 |
             ForEach-Object { "{0,8:N1} Mo  {1}" -f ($_.Length/1MB), $_.FullName.Replace("$PWD\dist\Transcripteur\","") }
 
+      - name: Publier les traces de diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic
+          path: |
+            sortie-exe.log
+            build/Transcripteur/warn-Transcripteur.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Publier le dossier livrable (artefact)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Transcripteur-windows
           path: dist/Transcripteur/
+          if-no-files-found: ignore
           retention-days: 30
 
       # Sur un tag v*, publie le zip en Release : c'est le lien unique et

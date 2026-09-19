@@ -49,11 +49,15 @@ if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 
 rem --- 5. PyInstaller ------------------------------------------------------
+rem Un build local est un build de developpement : la mise a jour automatique
+rem reste desactivee. Seule la CI, sur un tag v*, inscrit un vrai numero.
+echo dev> version.txt
 echo [5/5] Construction de l'executable...
 "%VPY%" -m PyInstaller ^
   --noconfirm --clean --onedir --console ^
   --name Transcripteur ^
   --add-data "ui;ui" ^
+  --add-data "version.txt;." ^
   --collect-all faster_whisper ^
   --collect-all ctranslate2 ^
   --collect-all av ^

@@ -9,6 +9,19 @@
 </head>
 <body>
 
+<!-- ========================= MISE À JOUR ========================= -->
+<div id="bandeau-maj" class="bandeau" hidden>
+  <p class="bandeau-texte">
+    <strong id="maj-titre"></strong>
+    <span id="maj-detail" class="meta"></span>
+  </p>
+  <div class="bandeau-actions">
+    <button id="maj-installer" class="principal compact">Mettre à jour</button>
+    <button id="maj-plus-tard" class="lien-bouton">Plus tard</button>
+  </div>
+  <div id="maj-barre" class="barre" hidden><span></span></div>
+</div>
+
 <!-- ============================ ACCUEIL ============================ -->
 <main id="accueil" class="page">
   <header class="entete-accueil">
@@ -82,6 +95,14 @@
     <button type="submit" id="lancer" class="principal" disabled>Lancer la transcription</button>
     <p class="note">Les textes sont enregistrés au fur et à mesure dans
       <code id="dossier-sortie"></code>.</p>
+    <p class="note pied-version">
+      <span id="version">Transcripteur</span>
+      <label class="case-maj">
+        <input type="checkbox" id="maj-auto" checked>
+        <span>Me prévenir des nouvelles versions</span>
+      </label>
+      <button type="button" id="maj-verifier" class="lien-bouton">Vérifier maintenant</button>
+    </p>
   </form>
 </main>
 
