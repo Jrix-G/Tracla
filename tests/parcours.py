@@ -9,6 +9,7 @@ export texte, arret propre.
 """
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -26,6 +27,30 @@ def verifie(nom, condition, detail=""):
     print(("  [ok] " if condition else "  [KO] ") + nom +
           (" — " + str(detail) if detail else ""))
     return condition
+
+
+def lire_flux(url, secondes=6):
+    """Lit un flux SSE pendant quelques secondes et renvoie les evenements.
+
+    Une fois le rattrapage termine, le serveur se tait jusqu'au ping suivant :
+    un timeout de lecture est donc la fin normale du rattrapage, pas une
+    erreur. Bloquer en attendant une ligne rendait le test dependant du
+    hasard (course avec le ping de 15 s : gagnee sous Linux, perdue sous
+    Windows)."""
+    evts = []
+    debut = time.time()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url),
+                                    timeout=secondes) as flux:
+            for ligne in flux:
+                ligne = ligne.decode("utf-8").strip()
+                if ligne.startswith("data: "):
+                    evts.append(json.loads(ligne[6:]))
+                if time.time() - debut > secondes:
+                    break
+    except (TimeoutError, socket.timeout, urllib.error.URLError, OSError):
+        pass
+    return evts
 
 
 def demande(url, data=None, entetes=None, methode=None):
@@ -131,30 +156,14 @@ def parcours(base, modele="base", chemin_audio=None, duree_max=900):
                 "%.1f vs %.1f" % (segments[-1]["fin"], duree_audio))
 
     # --- reprise du flux (rechargement de page) --------------------------
-    rejoue = []
-    req = urllib.request.Request(base + "/api/stream?depuis=%d" % max(0, dernier_i - 1))
-    with urllib.request.urlopen(req, timeout=15) as flux:
-        debut = time.time()
-        for ligne in flux:
-            if time.time() - debut > 6:
-                break
-            ligne = ligne.decode("utf-8").strip()
-            if ligne.startswith("data: "):
-                rejoue.append(json.loads(ligne[6:]))
+    rejoue = lire_flux(base + "/api/stream?depuis=%d" % max(0, dernier_i - 1))
     verifie("reprise SSE depuis un index", len(rejoue) >= 1,
             "%d evenements rejoues" % len(rejoue))
-    rejoue_tout = []
-    req = urllib.request.Request(base + "/api/stream?depuis=0")
-    with urllib.request.urlopen(req, timeout=15) as flux:
-        debut = time.time()
-        for ligne in flux:
-            if time.time() - debut > 6:
-                break
-            ligne = ligne.decode("utf-8").strip()
-            if ligne.startswith("data: "):
-                rejoue_tout.append(json.loads(ligne[6:]))
+    rejoue_tout = lire_flux(base + "/api/stream?depuis=0")
     verifie("reprise depuis 0 rejoue tous les segments",
-            sum(1 for e in rejoue_tout if e["type"] == "segment") == len(segments))
+            sum(1 for e in rejoue_tout if e["type"] == "segment") == len(segments),
+            "%d rejoues / %d attendus"
+            % (sum(1 for e in rejoue_tout if e["type"] == "segment"), len(segments)))
 
     # --- export texte ----------------------------------------------------
     s, _, corps = demande(base + "/api/texte?ts=1")
