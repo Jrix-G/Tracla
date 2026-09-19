@@ -1,0 +1,457 @@
+# -*- coding: utf-8 -*-
+"""Lecture de la page d'un cours UNESS : quelles diapos, quels mp3, quels titres.
+
+Rien n'est code en dur sur un cours precis. On part de index.htm, on suit les
+fichiers de donnees du lecteur Adobe Presenter, et on ne retombe sur le sondage
+des numeros qu'en dernier recours.
+"""
+
+import json
+import os
+import re
+import unicodedata
+from urllib.parse import unquote, urljoin, urlparse
+from xml.etree import ElementTree
+
+# Liste blanche : la session de l'utilisateur ne part jamais ailleurs.
+DOMAINES = ("formation.uness.fr",)
+
+
+def _mode_test():
+    """Les tests font tourner un faux Moodle en http sur 127.0.0.1. Cette
+    ouverture n'existe que si la variable d'environnement est posee, ce qui
+    n'arrive jamais dans le livrable."""
+    return os.environ.get("TRANSCRIPTEUR_TEST_UNESS") == "1"
+
+# Fichiers de donnees connus des sorties Adobe Presenter / Captivate. On les
+# essaie dans cet ordre ; le premier qui donne des diapos gagne.
+MANIFESTES = (
+    "data/presentation.xml",
+    "data/presentationData.js",
+    "data/vt_data.js",
+    "data/slides.xml",
+    "data/manifest.xml",
+    "data/data.js",
+    "data/project.txt",
+    "data/assets/presentation.xml",
+    "presentation.xml",
+    "imsmanifest.xml",
+)
+
+MP3_RE = re.compile(r"[A-Za-z0-9_.\-]+\.mp3", re.IGNORECASE)
+# 'a24x76.mp3' -> ('a24x', '76'). Le prefixe est propre a chaque cours.
+MOTIF_RE = re.compile(r"^(.*?)(\d+)(\.mp3)$", re.IGNORECASE)
+
+MAX_DIAPOS = 2000  # garde-fou : on ne sonde jamais indefiniment
+
+
+class ErreurCours(Exception):
+    """Erreur montrable telle quelle a l'utilisateur."""
+
+
+# ---------------------------------------------------------------------------
+# URL
+# ---------------------------------------------------------------------------
+
+def verifier_url(url):
+    """Valide l'URL saisie et renvoie (url_index, base) ou leve ErreurCours.
+
+    'base' est le dossier du cours, termine par '/' : c'est la racine a
+    laquelle 'data/xxx.mp3' est relatif.
+    """
+    url = (url or "").strip()
+    if not url:
+        raise ErreurCours("Colle d'abord le lien de ton cours UNESS.")
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        url = "https://" + url
+    p = urlparse(url)
+    hote = (p.hostname or "").lower()
+    local = _mode_test() and hote in ("127.0.0.1", "localhost")
+    if p.scheme.lower() != "https" and not local:
+        raise ErreurCours("Le lien doit commencer par https:// "
+                          "(connexion chiffree).")
+    if hote not in DOMAINES and not local:
+        raise ErreurCours(
+            "Ce lien ne semble pas etre un cours UNESS. Seuls les liens de "
+            "%s sont acceptes, et celui-ci pointe vers %s."
+            % (DOMAINES[0], hote or "un site inconnu"))
+    chemin = p.path or "/"
+    # On accepte l'URL du dossier comme celle d'un fichier de la page.
+    if chemin.endswith("/"):
+        base_chemin, index = chemin, chemin + "index.htm"
+    else:
+        dernier = chemin.rsplit("/", 1)[-1]
+        if "." in dernier:
+            base_chemin = chemin.rsplit("/", 1)[0] + "/"
+            index = chemin
+        else:
+            base_chemin = chemin + "/"
+            index = base_chemin + "index.htm"
+    racine = "%s://%s" % (p.scheme.lower(), p.netloc)
+    return racine + index, racine + base_chemin
+
+
+def identifiant(base):
+    """Cle de cache stable et sans surprise pour un cours donne."""
+    p = urlparse(base)
+    bouts = [b for b in p.path.split("/") if b]
+    # .../pluginfile.php/116687/mod_resource/content/0/  -> '116687-content-0'
+    interessants = [b for b in bouts if b not in
+                    ("pluginfile.php", "mod_resource", "formation", "draftfile.php")]
+    cle = "-".join(interessants[-3:]) or "cours"
+    return re.sub(r"[^A-Za-z0-9_.\-]", "_", cle)[:60]
+
+
+# ---------------------------------------------------------------------------
+# Titres
+# ---------------------------------------------------------------------------
+
+def _propre(txt):
+    if not txt:
+        return ""
+    txt = unicodedata.normalize("NFC", str(txt))
+    txt = re.sub(r"<[^>]+>", " ", txt)            # residus de balises
+    txt = txt.replace(" ", " ")
+    txt = re.sub(r"\s+", " ", txt).strip()
+    # Le lecteur tronque a l'ecran ; un titre qui finit par des points de
+    # suspension vient de l'affichage, pas des donnees.
+    return txt.strip(" .…") if txt.endswith(("...", "…")) else txt
+
+
+def _desechapper(txt):
+    """Les fichiers de donnees du lecteur sont souvent doublement encodes."""
+    if not txt:
+        return txt
+    for _ in range(2):
+        avant = txt
+        if "%" in txt:
+            try:
+                txt = unquote(txt)
+            except Exception:
+                pass
+        if "&" in txt:
+            for ent, car in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                             ("&quot;", '"'), ("&#39;", "'"), ("&apos;", "'"),
+                             ("&nbsp;", " ")):
+                txt = txt.replace(ent, car)
+        if "\\u" in txt:
+            try:
+                txt = txt.encode("utf-8").decode("unicode_escape")
+            except Exception:
+                pass
+        if txt == avant:
+            break
+    return txt
+
+
+# ---------------------------------------------------------------------------
+# Analyse des fichiers de donnees
+# ---------------------------------------------------------------------------
+
+def _diapos_depuis_xml(texte):
+    """Sortie Adobe Presenter : des elements de diapo portant un titre et,
+    quelque part, un nom de mp3."""
+    try:
+        racine = ElementTree.fromstring(texte.encode("utf-8", "replace")
+                                        if isinstance(texte, str) else texte)
+    except Exception:
+        return []
+
+    diapos = []
+    for el in racine.iter():
+        nom = el.tag.rsplit("}", 1)[-1].lower()
+        if nom not in ("slide", "item", "page", "frame", "resource"):
+            continue
+        attrs = {k.rsplit("}", 1)[-1].lower(): v for k, v in el.attrib.items()}
+        # Le mp3 peut etre un attribut, un texte d'enfant, ou plus bas.
+        blob = " ".join([texte_el for texte_el in
+                         [el.text or ""] + list(attrs.values()) +
+                         [(e.text or "") + " " + " ".join(e.attrib.values())
+                          for e in el.iter()]])
+        mp3 = MP3_RE.search(blob)
+        titre = ""
+        for cle in ("title", "label", "name", "displayname", "text", "navtitle"):
+            if attrs.get(cle):
+                titre = _propre(_desechapper(attrs[cle]))
+                if titre:
+                    break
+        if not titre:
+            for enfant in el:
+                if enfant.tag.rsplit("}", 1)[-1].lower() in (
+                        "title", "label", "name", "text"):
+                    titre = _propre(_desechapper(enfant.text or ""))
+                    if titre:
+                        break
+        if mp3 or titre:
+            diapos.append({"titre": titre,
+                           "fichier": mp3.group(0) if mp3 else None})
+    return diapos
+
+
+def _diapos_depuis_js(texte):
+    """Sortie JS : souvent un gros objet JSON, parfois du JavaScript.
+    On tente le JSON d'abord, puis on se rabat sur un appariement local
+    titre <-> mp3 dans l'ordre du fichier."""
+    diapos = []
+
+    # 1) Un JSON complet quelque part dans le fichier. On ne tente que les
+    #    quelques premieres accolades : au-dela on est dans du code, pas dans
+    #    des donnees, et l'essai coute cher sur un fichier de 1 Mo.
+    decodeur = json.JSONDecoder()
+    for essai, m in enumerate(re.finditer(r"[\[{]", texte)):
+        if essai >= 8:
+            break
+        try:
+            donnees = decodeur.raw_decode(texte, m.start())[0]
+        except Exception:
+            continue
+        trouve = _ranger(_diapos_depuis_json(donnees))
+        if len(trouve) >= 2:
+            return trouve
+
+    # 2) Appariement dans l'ordre : chaque mp3 prend le titre le plus proche
+    #    situe avant lui.
+    titres = [(m.start(), _propre(_desechapper(m.group(1))))
+              for m in re.finditer(
+                  r"""(?:title|label|name|navTitle)\s*[:=]\s*["']([^"']{2,200})["']""",
+                  texte, re.IGNORECASE)]
+    for m in MP3_RE.finditer(texte):
+        avant = [t for pos, t in titres if pos < m.start() and t]
+        diapos.append({"titre": avant[-1] if avant else "",
+                       "fichier": m.group(0)})
+    return diapos
+
+
+def _diapos_depuis_json(donnees):
+    """Parcourt un objet JSON a la recherche de dictionnaires de diapo."""
+    trouve = []
+
+    def visiter(noeud):
+        if isinstance(noeud, dict):
+            bas = {str(k).lower(): v for k, v in noeud.items()}
+            mp3 = None
+            for v in bas.values():
+                if isinstance(v, str) and v.lower().endswith(".mp3"):
+                    mp3 = v.rsplit("/", 1)[-1]
+                    break
+            titre = ""
+            for cle in ("title", "label", "name", "displayname", "navtitle"):
+                v = bas.get(cle)
+                if isinstance(v, str) and v.strip():
+                    titre = _propre(_desechapper(v))
+                    break
+            if mp3:
+                trouve.append({"titre": titre, "fichier": mp3})
+            for v in noeud.values():
+                visiter(v)
+        elif isinstance(noeud, list):
+            for v in noeud:
+                visiter(v)
+
+    visiter(donnees)
+    return trouve
+
+
+def _titres_depuis_html(html):
+    """Le plan (Outline) dans index.htm, quand il y est en dur."""
+    titres = []
+    for m in re.finditer(
+            r"""<[^>]*class=["'][^"']*(?:outline|toc|slide)[^"']*["'][^>]*>"""
+            r"""(.*?)</[a-z]+>""", html, re.IGNORECASE | re.DOTALL):
+        t = _propre(_desechapper(m.group(1)))
+        if 2 <= len(t) <= 200:
+            titres.append(t)
+    return titres
+
+
+# ---------------------------------------------------------------------------
+# Decouverte
+# ---------------------------------------------------------------------------
+
+def _ranger(diapos):
+    """Deduplique, numerote, et jette les entrees vides."""
+    vues, propres = set(), []
+    for d in diapos:
+        f = (d.get("fichier") or "").strip() or None
+        if f and f.lower() in vues:
+            continue
+        if f:
+            vues.add(f.lower())
+        propres.append({"titre": d.get("titre") or "", "fichier": f})
+    return propres
+
+
+def _numero_de(fichier):
+    m = MOTIF_RE.match(fichier or "")
+    return int(m.group(2)) if m else None
+
+
+def decouvrir(client, url_index, base, journal=None):
+    """Renvoie (titre_cours, [{'n', 'titre', 'fichier'}...], 'methode').
+
+    'client' est un uness.telechargement.Client deja authentifie : il expose
+    .texte(url) -> str|None et .existe(url) -> bool.
+    """
+    dire = journal or (lambda *a: None)
+
+    html = client.texte(url_index)
+    if html is None:
+        raise ErreurCours(
+            "Impossible de lire la page du cours. Verifie le lien, et que tu "
+            "es bien connecte a UNESS.")
+
+    titre_cours = ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    if m:
+        titre_cours = _propre(_desechapper(m.group(1)))
+
+    # -- 1. Les manifestes connus, plus les scripts reellement charges -------
+    candidats = list(MANIFESTES)
+    for m in re.finditer(r"""(?:src|href)\s*=\s*["']([^"']+\.(?:js|xml|txt))["']""",
+                         html, re.IGNORECASE):
+        chemin = m.group(1)
+        if not chemin.startswith(("http://", "https://", "//")):
+            candidats.append(chemin)
+
+    vus = set()
+    for chemin in candidats:
+        url = urljoin(base, chemin)
+        if url in vus:
+            continue
+        vus.add(url)
+        texte = client.texte(url)
+        if not texte:
+            continue
+        est_xml = texte.lstrip().startswith("<?xml") or chemin.endswith(".xml")
+        diapos = (_diapos_depuis_xml(texte) if est_xml
+                  else _diapos_depuis_js(texte))
+        if not diapos:
+            diapos = (_diapos_depuis_js(texte) if est_xml
+                      else _diapos_depuis_xml(texte))
+        diapos = _ranger(diapos)
+        avec_audio = [d for d in diapos if d["fichier"]]
+        if len(avec_audio) >= 2:
+            dire("Plan trouve dans %s : %d diapos."
+                 % (chemin, len(diapos)))
+            titre_cours = titre_cours or _titre_dans(texte)
+            return titre_cours, _numeroter(diapos), chemin
+
+    # -- 2. Balayage : tout mp3 cite quelque part dans la page ---------------
+    tous = _ranger([{"titre": "", "fichier": f} for f in MP3_RE.findall(html)])
+    if len(tous) >= 2:
+        dire("Noms de fichiers trouves directement dans la page.")
+        titres = _titres_depuis_html(html)
+        for i, d in enumerate(tous):
+            if i < len(titres):
+                d["titre"] = titres[i]
+        return titre_cours, _numeroter(tous), "index.htm"
+
+    # -- 3. Dernier recours : deduire le motif et sonder ---------------------
+    graine = None
+    for source in (html, *(client.texte(urljoin(base, c)) or "" for c in MANIFESTES)):
+        m = MP3_RE.search(source or "")
+        if m and MOTIF_RE.match(m.group(0)):
+            graine = m.group(0)
+            break
+    if not graine:
+        raise ErreurCours(
+            "Aucun fichier audio trouve sur cette page. Verifie que le lien "
+            "pointe bien vers le lecteur du cours (index.htm) et non vers la "
+            "page Moodle qui le contient.")
+
+    total = _total_annonce(html)
+    dire("Motif deduit de %s : sondage des numeros." % graine)
+    diapos = sonder(client, base, graine, total, dire)
+    if not diapos:
+        raise ErreurCours("Aucun fichier audio trouve sur cette page.")
+    return titre_cours, diapos, "sondage"
+
+
+def _titre_dans(texte):
+    for motif in (r"""(?:presentationTitle|courseTitle|projectName)\s*[:=]\s*["']([^"']{2,200})["']""",
+                  r"""<(?:title|presentationTitle)>([^<]{2,200})</"""):
+        m = re.search(motif, texte, re.IGNORECASE)
+        if m:
+            return _propre(_desechapper(m.group(1)))
+    return ""
+
+
+def _total_annonce(html):
+    """Nombre de diapos si la page le dit (sinon None)."""
+    for motif in (r"""(?:slideCount|totalSlides|nbSlides|slides?Count)\s*[:=]\s*(\d+)""",
+                  r"""(?:slide|diapo)\w*\s*=\s*(\d{1,4})\s*;"""):
+        m = re.search(motif, html, re.IGNORECASE)
+        if m:
+            n = int(m.group(1))
+            if 1 < n <= MAX_DIAPOS:
+                return n
+    return None
+
+
+def sonder(client, base, graine, total, dire=lambda *a: None):
+    """Repli : a24x1.mp3, a24x2.mp3... On ne s'arrete pas au premier trou.
+
+    - si le nombre de diapos est connu, on va jusqu'au bout (une diapo sans
+      audio reste une diapo) ;
+    - sinon, deux absences consecutives signent la fin.
+    """
+    m = MOTIF_RE.match(graine)
+    prefixe, suffixe = m.group(1), m.group(3)
+    largeur = len(m.group(2)) if m.group(2).startswith("0") else 0
+
+    diapos, trous = [], 0
+    n = 1
+    while n <= (total or MAX_DIAPOS):
+        nom = "%s%s%s" % (prefixe, str(n).zfill(largeur), suffixe)
+        if client.existe(urljoin(base, "data/" + nom)):
+            diapos.append({"n": n, "titre": "", "fichier": nom})
+            trous = 0
+        else:
+            diapos.append({"n": n, "titre": "", "fichier": None})
+            trous += 1
+            if not total and trous >= 2:
+                del diapos[-2:]          # les deux absences ne comptent pas
+                break
+        n += 1
+    dire("Sondage termine : %d diapos, dont %d avec audio."
+         % (len(diapos), sum(1 for d in diapos if d["fichier"])))
+    return diapos
+
+
+def _numeroter(diapos):
+    """Le numero de diapo vient du nom de fichier quand il s'y trouve
+    (a24x7.mp3 -> diapo 7) : c'est lui qui fait foi, pas l'ordre de lecture
+    du manifeste. On complete les trous pour que le plan reste continu."""
+    numeros = [_numero_de(d["fichier"]) for d in diapos]
+    if all(n is not None for n in numeros) and len(set(numeros)) == len(numeros):
+        par_numero = {n: d for n, d in zip(numeros, diapos)}
+        sortie = []
+        for n in range(1, max(numeros) + 1):
+            d = par_numero.get(n)
+            sortie.append({"n": n,
+                           "titre": d["titre"] if d else "",
+                           "fichier": d["fichier"] if d else None})
+        return sortie
+    return [{"n": i + 1, "titre": d["titre"], "fichier": d["fichier"]}
+            for i, d in enumerate(diapos)]
+
+
+def vocabulaire(titre_cours, diapos, limite=850):
+    """Amorce pour l'initial_prompt de Whisper : le titre du cours puis les
+    titres de diapos, dedupliques, tronques a la limite du prompt (Whisper
+    n'en garde que 224 jetons ; on reste large mais borne)."""
+    bouts, vus = [], set()
+    for t in [titre_cours] + [d.get("titre") or "" for d in diapos]:
+        t = (t or "").strip(" .-—")
+        cle = t.lower()
+        if not t or cle in vus:
+            continue
+        vus.add(cle)
+        bouts.append(t)
+    sortie = ""
+    for t in bouts:
+        suivant = (sortie + ", " + t) if sortie else t
+        if len(suivant) > limite:
+            break
+        sortie = suivant
+    return sortie

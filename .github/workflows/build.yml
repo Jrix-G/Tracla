@@ -40,7 +40,7 @@ jobs:
       - name: Vérifier que les dépendances sont importables
         shell: pwsh
         run: |
-          python -c "import av, ctranslate2, faster_whisper, onnxruntime, tokenizers, numpy, flask, waitress; print('imports OK')"
+          python -c "import av, ctranslate2, faster_whisper, onnxruntime, tokenizers, numpy, flask, waitress, playwright.sync_api; print('imports OK')"
           if ($LASTEXITCODE) { throw "Une dependance manque" }
           python -c "import faster_whisper, os; d=os.path.join(os.path.dirname(faster_whisper.__file__),'assets'); print('assets VAD :', os.listdir(d))"
 
@@ -68,14 +68,28 @@ jobs:
             --collect-all onnxruntime `
             --collect-all huggingface_hub `
             --collect-submodules waitress `
+            --collect-all playwright `
             --hidden-import waitress `
             --hidden-import flask `
+            --hidden-import greenlet `
+            --hidden-import pyee `
             --exclude-module hf_xet `
             --exclude-module torch `
             --exclude-module tkinter `
             --exclude-module matplotlib `
             --exclude-module scipy `
             app.py
+
+      # Les modules UNESS ne dependent ni de Whisper ni de l'exe : on les teste
+      # tot, contre le faux Moodle, pour ne pas decouvrir une regression apres
+      # 20 minutes de build.
+      - name: Tester l'import UNESS (faux serveur)
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python tests/uness_test.py
+          if ($LASTEXITCODE) { throw "Les tests UNESS ont echoue" }
 
       - name: Test de fumée (démarrage, upload, Range, arrêt)
         run: python tests/smoke_exe.py
@@ -89,7 +103,8 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          foreach ($p in "dist/Transcripteur/modeles", "dist/Transcripteur/reglages.json") {
+          foreach ($p in "dist/Transcripteur/modeles", "dist/Transcripteur/reglages.json",
+                         "dist/Transcripteur/session-uness", "dist/Transcripteur/cours-uness") {
             if (Test-Path $p) { Remove-Item -Recurse -Force $p; "supprime : $p" }
           }
 

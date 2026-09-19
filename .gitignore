@@ -10,3 +10,9 @@ tests/tmp/
 *.png
 version.txt
 reglages.json
+
+# Import de cours UNESS : session du navigateur et cache des cours.
+# Ces dossiers contiennent des cookies de session : jamais dans le depot.
+session-uness/
+cours-uness/
+sortie-exe.log

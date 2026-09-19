@@ -66,8 +66,11 @@ echo [5/5] Construction de l'executable...
   --collect-all onnxruntime ^
   --collect-all huggingface_hub ^
   --collect-submodules waitress ^
+  --collect-all playwright ^
   --hidden-import waitress ^
   --hidden-import flask ^
+  --hidden-import greenlet ^
+  --hidden-import pyee ^
   --exclude-module hf_xet ^
   --exclude-module torch ^
   --exclude-module tkinter ^

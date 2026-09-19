@@ -67,6 +67,11 @@ import av
 import numpy as np
 from flask import Flask, Response, jsonify, request, send_file, stream_with_context
 
+from uness import assemblage as uness_assemblage
+from uness import cours as uness_cours
+from uness import recuperation as uness_recuperation
+from uness import session as uness_session
+
 # ---------------------------------------------------------------------------
 # Constantes
 # ---------------------------------------------------------------------------
@@ -98,19 +103,28 @@ EXTS_NAVIGATEUR = {".mp3", ".m4a", ".mp4", ".wav", ".ogg", ".oga",
                    ".webm", ".flac", ".aac"}
 
 # Hallucinations classiques de Whisper dans les silences.
+# ATTENTION : ces motifs sont compares au texte NORMALISE par normaliser(),
+# qui remplace toute ponctuation par une espace. Ecrire "sous-titres" ou
+# "amara.org" ici ne matcherait donc jamais : c'est "sous titres" et
+# "amara org" qui arrivent.
 JUNK = [
-    r"sous-titr(es|age).{0,40}",
-    r".{0,20}amara\.org.{0,20}",
-    r"merci d'avoir regard(e|é).{0,30}",
-    r"abonnez-vous.{0,30}",
-    r"(a bient(o|ô)t|au revoir)[ !.]*",
-    r"♪+", r"\[musique\]", r"\(musique\)",
+    r"sous titr(es|age).{0,40}",
+    r".{0,30}amara org.{0,20}",
+    r"merci d avoir regard(e|é).{0,30}",
+    r"abonnez vous.{0,30}",
+    r"(a bient(o|ô)t|au revoir)\s*",
+    r"musique", r"générique", r"generique",
     r"thanks for watching.{0,20}",
 ]
 JUNK_RE = re.compile(r"^(?:%s)$" % "|".join(JUNK), re.IGNORECASE)
 
 PROMPT_HESITATIONS = ("Euh, alors, ben, voila, du coup... euh, bon. "
                       "Donc euh, je disais, hein, voila.")
+
+# Import d'un cours UNESS : la session du navigateur et le cache des cours
+# vivent a cote de l'exe, dans des dossiers que l'utilisateur peut supprimer.
+DOSSIER_SESSION = os.path.join(app_dir(), "session-uness")
+DOSSIER_COURS = os.path.join(app_dir(), "cours-uness")
 
 # ---------------------------------------------------------------------------
 # Utilitaires
@@ -342,13 +356,28 @@ def couper_boucle(texte):
     return " ".join(mots)
 
 
-def est_hallucination(texte, no_speech_prob):
+def est_hallucination(texte, no_speech_prob, amorces=()):
     """Vrai seulement si le texte est un residu connu ET que Whisper doutait
-    deja de la presence de parole : on ne supprime jamais de vrai contenu."""
+    deja de la presence de parole : on ne supprime jamais de vrai contenu.
+
+    'amorces' contient les titres de diapos passes en initial_prompt. Dans un
+    silence, Whisper recrache parfois son prompt mot pour mot ; un titre de
+    diapo restitue tel quel, la ou il n'y a pas de parole, est donc du bruit,
+    pas du contenu. Le titre reste bien sur legitime s'il est prononce (le
+    doute sur la parole est alors faible).
+    """
     n = normaliser(texte)
     if not n:
         return True
-    return bool(JUNK_RE.match(n)) and no_speech_prob > 0.5
+    if no_speech_prob > 0.5 and JUNK_RE.match(n):
+        return True
+    return no_speech_prob > 0.6 and n in amorces
+
+
+def amorces_de(vocabulaire):
+    """Les titres du prompt, normalises, pour reperer un prompt recrache."""
+    return {normaliser(t) for t in (vocabulaire or "").split(",")
+            if len(normaliser(t)) > 3}
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +568,10 @@ class Job:
         self.debut_horloge = 0.0
         self.transcrit = 0.0
         self.options = {}
+        # Cours UNESS : vide pour un simple fichier audio.
+        self.chapitres = []           # [{n, titre, debut, fin, ...}]
+        self.titre_cours = ""
+        self.sans_audio = []
 
     # -- diffusion ---------------------------------------------------------
     def emettre(self, type_, data, durable=True):
@@ -679,18 +712,27 @@ def boucle_transcription(job_id, opts):
             n += 1
         JOB.sortie = chemin_txt
         fichier_txt = open(chemin_txt, "w", encoding="utf-8", newline="\n")
-        fichier_txt.write("# %s\n\n" % JOB.nom)
+        if JOB.chapitres:
+            # En-tete demande pour un cours : le titre, puis un soulignement.
+            fichier_txt.write("%s\n==============\n\n" % (JOB.titre_cours or JOB.nom))
+        else:
+            fichier_txt.write("# %s\n\n" % JOB.nom)
         fichier_txt.flush()
         JOB.emettre("fichier", {"chemin": chemin_txt})
 
         prompt = construire_prompt(opts.get("vocabulaire"),
                                    opts.get("hesitations", True))
+        amorces = amorces_de(opts.get("vocabulaire"))
         langue = opts.get("langue") or None
 
         position = 0.0
         precedent = ""      # dernier texte, pour la continuite entre fenetres
         dernier_txt = None
         repetitions = 0
+        # Suivi de la diapo courante : un intertitre n'est ecrit qu'au
+        # changement, pas a chaque segment.
+        etat_diapo = {"n": None}
+        chapitre_par_numero = {c["n"]: c for c in JOB.chapitres}
 
         while position < JOB.duree - 0.2 and not JOB.stop.is_set():
             audio = decoder_fenetre(JOB.chemin, position, WINDOW_SECONDS)
@@ -708,7 +750,11 @@ def boucle_transcription(job_id, opts):
                                 if prompt else (precedent or None),
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500),
-                word_timestamps=False,
+                # Pour un cours decoupe en diapos, il faut les horodatages de
+                # mots : c'est le seul moyen de recouper un segment que
+                # Whisper a fait chevaucher deux diapos (voir
+                # uness.assemblage.decouper_aux_frontieres).
+                word_timestamps=bool(JOB.chapitres),
                 temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
             )
             if langue is None:
@@ -717,9 +763,24 @@ def boucle_transcription(job_id, opts):
 
             def publier(debut, fin, texte):
                 """Ecrit un segment : a l'ecran ET sur le disque, tout de suite."""
+                diapo = None
+                if JOB.chapitres:
+                    diapo = uness_assemblage.diapo_a(debut, JOB.chapitres)
+                    if diapo is not None and diapo != etat_diapo["n"]:
+                        etat_diapo["n"] = diapo
+                        c = chapitre_par_numero.get(diapo) or {}
+                        entete = "Diapo %d%s [%s]" % (
+                            diapo, " — " + c["titre"] if c.get("titre") else "",
+                            hhmmss(c.get("debut", debut)))
+                        JOB.emettre("diapo", {"n": diapo,
+                                              "titre": c.get("titre", ""),
+                                              "debut": c.get("debut", debut),
+                                              "ts": hhmmss(c.get("debut", debut))})
+                        fichier_txt.write("\n%s\n" % entete)
                 JOB.emettre("segment", {"debut": round(debut, 2),
                                         "fin": round(fin, 2),
                                         "ts": hhmmss(debut),
+                                        "diapo": diapo,
                                         "texte": texte})
                 fichier_txt.write("[%s] %s\n" % (hhmmss(debut), texte))
                 fichier_txt.flush()
@@ -745,7 +806,8 @@ def boucle_transcription(job_id, opts):
                 if JOB.stop.is_set():
                     break
                 texte = couper_boucle(seg.text.strip())
-                if est_hallucination(texte, getattr(seg, "no_speech_prob", 0.0)):
+                if est_hallucination(texte, getattr(seg, "no_speech_prob", 0.0),
+                                     amorces):
                     continue
                 # Boucle inter-segments : 'oui.' 'oui.' 'oui.' ...
                 cle = normaliser(texte)
@@ -753,12 +815,19 @@ def boucle_transcription(job_id, opts):
                 dernier_txt = cle
                 if repetitions >= 3:
                     continue
-                courant = (position + seg.start, position + seg.end, texte)
-                if en_attente:
-                    publier(*en_attente)
-                    precedent = (precedent + " " + en_attente[2])[-200:]
-                    derniere_fin = en_attente[1]
-                en_attente = courant
+                morceaux = [(position + seg.start, position + seg.end, texte)]
+                if JOB.chapitres:
+                    mots = [(position + m.start, position + m.end, m.word)
+                            for m in (getattr(seg, "words", None) or [])]
+                    morceaux = uness_assemblage.decouper_aux_frontieres(
+                        position + seg.start, position + seg.end, texte,
+                        mots, JOB.chapitres)
+                for courant in morceaux:
+                    if en_attente:
+                        publier(*en_attente)
+                        precedent = (precedent + " " + en_attente[2])[-200:]
+                        derniere_fin = en_attente[1]
+                    en_attente = courant
 
             if JOB.stop.is_set():
                 if en_attente:
@@ -836,13 +905,17 @@ def config():
         "job": JOB.id,
         "version": VERSION,
         "depot": DEPOT,
+        "uness_domaine": uness_cours.DOMAINES[0],
+        "titre_cours": JOB.titre_cours,
+        "chapitres": JOB.chapitres,
+        "sans_audio": JOB.sans_audio,
     })
 
 
 @app.post("/api/upload")
 def upload():
     """Ecrit le fichier sur disque en streaming : jamais tout en RAM."""
-    if JOB.etat in ("modele", "transcription"):
+    if JOB.etat in ("modele", "transcription", "recuperation"):
         return jsonify({"erreur": "Une transcription est deja en cours."}), 409
 
     # Le nom arrive encode en pourcent : les en-tetes HTTP sont limites au
@@ -880,6 +953,11 @@ def upload():
     JOB.journal = []
     JOB.transcrit = 0.0
     JOB.stop = threading.Event()
+    # Un fichier audio ordinaire n'a pas de diapos : on efface celles d'un
+    # eventuel cours precedent, sinon la sortie serait decoupee au hasard.
+    JOB.chapitres = []
+    JOB.titre_cours = ""
+    JOB.sans_audio = []
 
     if lisible:
         JOB.chemin_lecture = cible
@@ -908,7 +986,7 @@ def upload():
 
 @app.post("/api/start")
 def start():
-    if JOB.etat in ("modele", "transcription"):
+    if JOB.etat in ("modele", "transcription", "recuperation"):
         return jsonify({"erreur": "Une transcription est deja en cours."}), 409
     if not JOB.chemin:
         return jsonify({"erreur": "Aucun fichier audio charge."}), 400
@@ -1004,15 +1082,274 @@ def _lire(chemin, debut, fin, bloc=256 * 1024):
 
 @app.get("/api/texte")
 def texte():
+    """Trois variantes : avec horodatages, texte seul, et Markdown.
+
+    Pour un cours UNESS, les titres de diapos deviennent des intertitres (ou
+    des '##' en Markdown) ; pour un simple fichier audio, rien ne change.
+    """
     horodatages = request.args.get("ts", "1") == "1"
+    markdown = request.args.get("md") == "1"
     lignes = []
+
     with JOB.verrou:
-        for e in JOB.journal:
-            if e["type"] == "segment":
-                lignes.append("[%s] %s" % (e["ts"], e["texte"])
-                              if horodatages else e["texte"])
-    corps = ("\n" if horodatages else " ").join(lignes)
+        chapitres = list(JOB.chapitres)
+        titre = JOB.titre_cours or os.path.splitext(JOB.nom)[0]
+        evenements = list(JOB.journal)
+
+    if markdown:
+        lignes.append("# %s\n" % titre)
+    elif chapitres:
+        lignes.append(titre)
+        lignes.append("==============\n")
+
+    par_numero = {c["n"]: c for c in chapitres}
+    courante = None
+    for e in evenements:
+        if e["type"] != "segment":
+            continue
+        n = e.get("diapo")
+        if n is not None and n != courante:
+            courante = n
+            c = par_numero.get(n) or {}
+            nom = "Diapo %d%s" % (n, " — " + c["titre"] if c.get("titre") else "")
+            ts = " [%s]" % hhmmss(c.get("debut", e["debut"])) if horodatages else ""
+            if lignes:
+                lignes.append("")
+            lignes.append(("## %s%s" % (nom, ts)) if markdown else (nom + ts))
+            lignes.append("")
+        lignes.append("[%s] %s" % (e["ts"], e["texte"])
+                      if horodatages else e["texte"])
+
+    if not horodatages and not chapitres and not markdown:
+        corps = " ".join(lignes)
+    else:
+        corps = "\n".join(lignes)
     return Response(corps, mimetype="text/plain; charset=utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Cours UNESS
+# ---------------------------------------------------------------------------
+
+COFFRE = uness_session.Coffre(DOSSIER_SESSION)
+CONNEXION = uness_session.Connexion(COFFRE)
+# La recuperation en cours. Un seul cours a la fois, comme un seul job.
+RECUP = {"objet": None, "thread": None}
+
+
+def _emettre_uness(type_, data, durable=True):
+    JOB.emettre(type_, data, durable=durable)
+
+
+def _url_demandee():
+    o = request.get_json(force=True, silent=True) or {}
+    return (o.get("url") or "").strip()
+
+
+def _recuperation(url):
+    """Renvoie la Recuperation en cours pour cette URL, ou en cree une."""
+    objet = RECUP["objet"]
+    if objet is not None and objet.url_index == uness_cours.verifier_url(url)[0]:
+        objet.rafraichir_cookies()
+        return objet
+    objet = uness_recuperation.Recuperation(url, COFFRE, DOSSIER_COURS,
+                                            _emettre_uness, JOB.stop)
+    RECUP["objet"] = objet
+    return objet
+
+
+@app.get("/api/uness/etat")
+def uness_etat():
+    """Ce que l'interface a besoin de savoir pour dessiner l'ecran d'accueil."""
+    return jsonify({
+        "fenetre": uness_session.playwright_disponible(),
+        "cookies": bool(COFFRE.lire()),
+        "connexion": CONNEXION.etat,
+        "message": CONNEXION.message,
+        "domaine": uness_cours.DOMAINES[0],
+        "cache": DOSSIER_COURS,
+    })
+
+
+@app.post("/api/uness/verifier")
+def uness_verifier():
+    """Valide le lien et teste la session, sans rien telecharger.
+
+    La session n'est declaree valide que si un fichier AUDIO du cours repond
+    de l'audio : Moodle renvoie sa page de connexion en 200, un code HTTP ne
+    prouve rien.
+    """
+    try:
+        r = _recuperation(_url_demandee())
+    except uness_cours.ErreurCours as e:
+        return jsonify({"erreur": str(e)}), 400
+    if not COFFRE.lire():
+        return jsonify({"connecte": False,
+                        "message": "Tu n'es pas encore connecte a UNESS."})
+    try:
+        if not r.diapos:
+            r.decouvrir()
+    except uness_cours.ErreurCours as e:
+        return jsonify({"connecte": False, "message": str(e)})
+    except Exception:
+        return jsonify({"connecte": False,
+                        "message": "Session expiree : reconnecte-toi."})
+    valide = r.session_valide()
+    return jsonify({
+        "connecte": valide,
+        "titre": r.titre,
+        "diapos": len(r.diapos),
+        "message": ("Connecte a UNESS." if valide
+                    else "Session expiree : reconnecte-toi."),
+    })
+
+
+@app.post("/api/uness/connexion")
+def uness_connexion():
+    """Ouvre la fenetre du navigateur. Ne bloque pas : l'interface suit l'etat."""
+    try:
+        r = _recuperation(_url_demandee())
+    except uness_cours.ErreurCours as e:
+        return jsonify({"erreur": str(e)}), 400
+    try:
+        CONNEXION.ouvrir(r.url_index, r.url_de_test(),
+                         quand_fini=lambda ok, msg: JOB.emettre(
+                             "uness", {"etape": "connexion", "ok": ok,
+                                       "message": msg}, durable=False))
+    except uness_session.ErreurConnexion as e:
+        return jsonify({"erreur": str(e), "manuel": True}), 503
+    return jsonify({"ok": True, "message": CONNEXION.message})
+
+
+@app.post("/api/uness/cookie")
+def uness_cookie():
+    """Repli manuel : l'utilisateur colle la valeur de son cookie de session."""
+    o = request.get_json(force=True, silent=True) or {}
+    # Le cookie doit porter le domaine du lien colle, sinon il ne partirait
+    # jamais avec les requetes.
+    from urllib.parse import urlparse
+    domaine = uness_cours.DOMAINES[0]
+    if o.get("url"):
+        try:
+            domaine = urlparse(uness_cours.verifier_url(o["url"])[1]).hostname or domaine
+        except uness_cours.ErreurCours as e:
+            return jsonify({"erreur": str(e)}), 400
+    elif RECUP["objet"]:
+        domaine = urlparse(RECUP["objet"].base).hostname or domaine
+    try:
+        cookies = uness_session.cookies_depuis_texte(o.get("texte"), domaine)
+    except uness_session.ErreurConnexion as e:
+        return jsonify({"erreur": str(e)}), 400
+    COFFRE.ecrire(cookies)
+    if RECUP["objet"]:
+        RECUP["objet"].rafraichir_cookies()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/uness/deconnexion")
+def uness_deconnexion():
+    """Efface le profil du navigateur et les cookies. Rien d'autre ne part."""
+    CONNEXION.annuler()
+    COFFRE.effacer()
+    if RECUP["objet"]:
+        RECUP["objet"].rafraichir_cookies()
+    CONNEXION.etat, CONNEXION.message = "repos", ""
+    return jsonify({"ok": True})
+
+
+@app.post("/api/uness/demarrer")
+def uness_demarrer():
+    """Recupere l'audio du cours, puis enchaine sur la transcription."""
+    if JOB.etat in ("modele", "transcription", "recuperation"):
+        return jsonify({"erreur": "Une transcription est deja en cours."}), 409
+    o = request.get_json(force=True, silent=True) or {}
+    try:
+        uness_cours.verifier_url(o.get("url") or "")
+    except uness_cours.ErreurCours as e:
+        return jsonify({"erreur": str(e)}), 400
+    if not COFFRE.lire():
+        return jsonify({"erreur": "Connecte-toi d'abord a UNESS."}), 401
+    if o.get("modele", "small") not in MODELS:
+        return jsonify({"erreur": "Modele inconnu."}), 400
+
+    nettoyer()
+    JOB.id += 1
+    JOB.journal = []
+    JOB.stop = threading.Event()
+    JOB.transcrit = 0.0
+    JOB.chapitres = []
+    JOB.sans_audio = []
+    JOB.etat = "recuperation"
+    RECUP["objet"] = None
+    RECUP["thread"] = threading.Thread(target=_recuperer_puis_transcrire,
+                                       args=(o, JOB.id), daemon=True)
+    RECUP["thread"].start()
+    return jsonify({"ok": True, "job": JOB.id})
+
+
+@app.get("/api/uness/chapitres")
+def uness_chapitres():
+    return jsonify({"titre": JOB.titre_cours, "chapitres": JOB.chapitres,
+                    "sans_audio": JOB.sans_audio})
+
+
+def _recuperer_puis_transcrire(o, job_id):
+    try:
+        r = uness_recuperation.Recuperation(o["url"], COFFRE, DOSSIER_COURS,
+                                            _emettre_uness, JOB.stop)
+        RECUP["objet"] = r
+        JOB.emettre("etat", {"etat": "recuperation",
+                             "message": "Recuperation de l'audio du cours"})
+        resultat = r.executer()
+        if resultat is None:
+            # La session a laches en route. On laisse l'interface proposer la
+            # reconnexion : le cache garde tout ce qui est deja telecharge.
+            JOB.etat = "erreur"
+            JOB.emettre("etat", {
+                "etat": "erreur", "reconnexion": True,
+                "message": "Session expiree : reconnecte-toi, puis relance. "
+                           "Les diapos deja recuperees ne seront pas "
+                           "retelechargees."})
+            return
+        chemin, chapitres, duree = resultat
+        if JOB.id != job_id or JOB.stop.is_set():
+            return
+
+        JOB.chemin = chemin
+        JOB.chemin_lecture = chemin
+        JOB.mime = "audio/mpeg"
+        JOB.duree = duree
+        JOB.chapitres = chapitres
+        JOB.titre_cours = r.titre
+        JOB.sans_audio = r.sans_audio
+        JOB.nom = r.titre
+        JOB.etat = "pret"
+        JOB.emettre("lecture_prete", {}, durable=False)
+
+        # Les titres du cours servent de vocabulaire : c'est ce qui fait la
+        # difference sur les termes medicaux.
+        voc = uness_cours.vocabulaire(r.titre, r.diapos)
+        saisi = (o.get("vocabulaire") or "").strip()
+        opts = {
+            "modele": o.get("modele", "small"),
+            "langue": (o.get("langue") or "").strip() or None,
+            "hesitations": bool(o.get("hesitations", True)),
+            "vocabulaire": (saisi + ", " + voc) if saisi else voc,
+        }
+        JOB.options = opts
+        JOB.etat = "modele"
+        boucle_transcription(job_id, opts)
+    except uness_recuperation.Interrompu:
+        JOB.etat = "arrete"
+        JOB.emettre("etat", {"etat": "arrete",
+                             "message": "Recuperation arretee."})
+    except (uness_cours.ErreurCours, uness_assemblage.ErreurAssemblage) as e:
+        JOB.etat = "erreur"
+        JOB.emettre("etat", {"etat": "erreur", "message": str(e)})
+    except Exception as e:
+        JOB.etat = "erreur"
+        JOB.emettre("etat", {"etat": "erreur",
+                             "message": "La recuperation du cours a echoue : %s" % e})
 
 
 @app.get("/api/version")
@@ -1044,7 +1381,7 @@ def maj_reglage():
 
 @app.post("/api/maj/installer")
 def maj_installer():
-    if JOB.etat in ("modele", "transcription"):
+    if JOB.etat in ("modele", "transcription", "recuperation"):
         return jsonify({"erreur": "Une transcription est en cours. Arrete-la "
                                   "avant de mettre a jour."}), 409
     try:
@@ -1106,6 +1443,12 @@ def instance_existante():
 
 
 def main():
+    # La fenetre de connexion a UNESS tourne dans un sous-processus : c'est la
+    # meme application, relancee avec ce drapeau. Elle n'ouvre ni serveur ni
+    # navigateur, elle ecrit son resultat dans le fichier indique.
+    if len(sys.argv) > 1 and sys.argv[1] == "--fenetre-connexion":
+        sys.exit(uness_session.main_fenetre(sys.argv[2:]))
+
     deja = instance_existante()
     if deja:
         print("Transcripteur tourne deja. Ouverture du navigateur.")

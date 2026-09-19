@@ -11,3 +11,6 @@ numpy==2.4.6            # derniere version compatible Python 3.11
 av==13.1.0                # decodage/transcodage audio : embarque ffmpeg
 flask==3.1.0
 waitress==3.0.2           # serveur WSGI multi-thread (pas le serveur de dev)
+# Fenetre de connexion a UNESS : pilote le Microsoft Edge DEJA installe
+# (channel="msedge"), donc aucun navigateur n'est telecharge ni embarque.
+playwright==1.56.0

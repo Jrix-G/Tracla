@@ -15,6 +15,10 @@ const etat = {
   source: null,      // EventSource
   modeles: {},
   coeurs: 4,
+  entree: "fichier",  // "fichier" | "uness"  (d'où vient l'audio)
+  chapitres: [],      // cours UNESS : {n, titre, debut, fin, sans_audio, el}
+  diapo: -1,          // diapo surlignée dans le plan
+  uness: { connecte: false, fenetre: true, domaine: "formation.uness.fr" },
 };
 
 /* Vitesses en « × temps réel » ramenées à 4 cœurs, int8. base et small sont
@@ -67,10 +71,17 @@ fetch("/api/config").then((r) => r.json()).then((c) => {
   etat.modeles = c.modeles;
   etat.coeurs = c.coeurs || 4;
   $("#dossier-sortie").textContent = c.dossier_sortie;
+  if (c.uness_domaine) $("#uness-domaine").textContent = c.uness_domaine;
   construire_qualites();
-  if (["modele", "transcription", "fini", "arrete", "erreur"].includes(c.etat)) {
+  if (["recuperation", "modele", "transcription", "fini", "arrete", "erreur"]
+      .includes(c.etat)) {
     // Reprise après un rechargement de page : on retrouve le travail en cours.
     etat.nom = c.nom; etat.duree = c.duree;
+    if (c.chapitres && c.chapitres.length) {
+      etat.chapitres = c.chapitres;
+      etat.nom = c.titre_cours || c.nom;
+      construire_plan(c.sans_audio || []);
+    }
     passer_en_travail();
   }
 });
@@ -153,7 +164,7 @@ function envoyer(fichier) {
     etat.nom = r.nom; etat.duree = r.duree;
     $("#fichier-duree").textContent = duree_humaine(r.duree);
     fichier_pret = true;
-    $("#lancer").disabled = false;
+    maj_bouton_lancer();
   };
   xhr.onerror = () => {
     barre.hidden = true;
@@ -163,17 +174,163 @@ function envoyer(fichier) {
   xhr.send(fichier);
 }
 
+/* --------------------------- Cours UNESS ---------------------------
+   L'application ne voit jamais le mot de passe : elle ouvre une vraie
+   fenêtre de navigateur, l'utilisateur s'y connecte, et elle relit les
+   cookies de cette fenêtre. Ici on ne fait que piloter cet aller-retour. */
+
+function choisir_source(quoi) {
+  etat.entree = quoi;
+  const fichier = quoi === "fichier";
+  $("#source-fichier").hidden = !fichier;
+  $("#source-uness").hidden = fichier;
+  $("#onglet-fichier").setAttribute("aria-selected", String(fichier));
+  $("#onglet-uness").setAttribute("aria-selected", String(!fichier));
+  $("#note-uness").hidden = fichier;
+  $("#lancer").textContent = fichier
+    ? "Lancer la transcription" : "Récupérer et transcrire";
+  erreur_accueil("");
+  maj_bouton_lancer();
+  if (!fichier) etat_uness();
+}
+
+$("#onglet-fichier").addEventListener("click", () => choisir_source("fichier"));
+$("#onglet-uness").addEventListener("click", () => choisir_source("uness"));
+
+function maj_bouton_lancer() {
+  $("#lancer").disabled = etat.entree === "fichier"
+    ? !fichier_pret
+    : !($("#uness-url").value.trim() && etat.uness.connecte);
+}
+
+$("#uness-url").addEventListener("input", maj_bouton_lancer);
+
+function afficher_session(connecte, texte) {
+  etat.uness.connecte = connecte;
+  $("#session-pastille").className = "pastille " + (connecte ? "ok" : "ko");
+  $("#session-texte").textContent = texte;
+  $("#uness-deconnexion").hidden = !connecte && !etat.uness.cookies;
+  $("#uness-connexion").textContent = connecte
+    ? "Se reconnecter" : "Se connecter à UNESS";
+  maj_bouton_lancer();
+}
+
+function etat_uness() {
+  fetch("/api/uness/etat").then((r) => r.json()).then((s) => {
+    etat.uness.fenetre = s.fenetre;
+    etat.uness.cookies = s.cookies;
+    if (s.domaine) $("#uness-domaine").textContent = s.domaine;
+    // Sans fenêtre possible, le repli manuel n'est plus un repli : on l'ouvre.
+    if (!s.fenetre) $("#uness-manuel").open = true;
+    if (!s.cookies) { afficher_session(false, "Non connecté à UNESS"); return; }
+    verifier_session();
+  }).catch(() => afficher_session(false, "Non connecté à UNESS"));
+}
+
+function verifier_session() {
+  const url = $("#uness-url").value.trim();
+  if (!url) {
+    afficher_session(false, "Colle d'abord le lien du cours");
+    return Promise.resolve(false);
+  }
+  $("#session-texte").textContent = "Vérification de la session…";
+  return fetch("/api/uness/verifier", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  }).then((r) => r.json()).then((s) => {
+    if (s.erreur) { afficher_session(false, "Non connecté"); erreur_accueil(s.erreur); return false; }
+    erreur_accueil("");
+    afficher_session(s.connecte, s.connecte
+      ? `Connecté à UNESS${s.diapos ? ` · ${s.diapos} diapos trouvées` : ""}`
+      : s.message);
+    return s.connecte;
+  }).catch(() => { afficher_session(false, "Vérification impossible"); return false; });
+}
+
+$("#uness-url").addEventListener("change", () => {
+  if (etat.uness.cookies) verifier_session();
+});
+
+$("#uness-connexion").addEventListener("click", () => {
+  const url = $("#uness-url").value.trim();
+  if (!url) { erreur_accueil("Colle d'abord le lien de ton cours UNESS."); return; }
+  erreur_accueil("");
+  $("#uness-connexion").disabled = true;
+  $("#session-texte").textContent = "Ouverture de la fenêtre de connexion…";
+  if (!etat.source) brancher_flux();   // pour recevoir la fin de la connexion
+  fetch("/api/uness/connexion", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  }).then((r) => r.json().then((j) => ({ ok: r.ok, j }))).then(({ ok, j }) => {
+    $("#uness-connexion").disabled = false;
+    if (!ok) {
+      erreur_accueil(j.erreur || "La fenêtre de connexion n'a pas pu s'ouvrir.");
+      $("#uness-manuel").open = true;
+      afficher_session(false, "Non connecté à UNESS");
+      return;
+    }
+    $("#session-texte").textContent =
+      "Connecte-toi dans la fenêtre qui vient de s'ouvrir…";
+  }).catch(() => {
+    $("#uness-connexion").disabled = false;
+    erreur_accueil("La fenêtre de connexion n'a pas pu s'ouvrir.");
+    $("#uness-manuel").open = true;
+  });
+});
+
+$("#uness-cookie-ok").addEventListener("click", () => {
+  const texte = $("#uness-cookie").value;
+  fetch("/api/uness/cookie", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ texte, url: $("#uness-url").value.trim() }),
+  }).then((r) => r.json()).then((j) => {
+    if (j.erreur) { erreur_accueil(j.erreur); return; }
+    $("#uness-cookie").value = "";
+    erreur_accueil("");
+    etat.uness.cookies = true;
+    verifier_session().then((ok) => { if (ok) $("#uness-manuel").open = false; });
+  });
+});
+
+$("#uness-deconnexion").addEventListener("click", () => {
+  if (!confirm("Effacer la session UNESS enregistrée sur cet ordinateur ? " +
+               "Tu devras te reconnecter la prochaine fois.")) return;
+  fetch("/api/uness/deconnexion", { method: "POST" }).then(() => {
+    etat.uness.cookies = false;
+    afficher_session(false, "Session effacée");
+    toast("Session UNESS effacée.");
+  });
+});
+
 /* ---------------------------- Lancement ---------------------------- */
 
 $("#formulaire").addEventListener("submit", (e) => {
   e.preventDefault();
-  if (!fichier_pret) { erreur_accueil("Choisis d'abord un fichier audio."); return; }
   const corps = {
     modele: document.querySelector('input[name="modele"]:checked').value,
     langue: $("#langue").value,
     hesitations: $("#hesitations").checked,
     vocabulaire: $("#vocabulaire").value,
   };
+
+  if (etat.entree === "uness") {
+    const url = $("#uness-url").value.trim();
+    if (!url) { erreur_accueil("Colle d'abord le lien de ton cours UNESS."); return; }
+    if (!etat.uness.connecte) { erreur_accueil("Connecte-toi d'abord à UNESS."); return; }
+    corps.url = url;
+    $("#lancer").disabled = true;
+    fetch("/api/uness/demarrer", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(corps),
+    }).then((r) => r.json()).then((r) => {
+      if (r.erreur) { erreur_accueil(r.erreur); $("#lancer").disabled = false; return; }
+      etat.nom = "Cours UNESS";
+      passer_en_travail();
+    });
+    return;
+  }
+
+  if (!fichier_pret) { erreur_accueil("Choisis d'abord un fichier audio."); return; }
   $("#lancer").disabled = true;
   fetch("/api/start", {
     method: "POST",
@@ -191,8 +348,14 @@ function passer_en_travail() {
   $("#titre-audio").textContent = etat.nom;
   $("#temps").textContent = `00:00:00 / ${hhmmss(etat.duree)}`;
   $("#piste").setAttribute("aria-valuemax", Math.floor(etat.duree));
-  audio.src = "/api/audio?j=" + Date.now();
+  // Pour un cours UNESS, l'audio n'existe pas encore : il arrive avec
+  // l'évènement « lecture_prete », à la fin de la récupération.
+  if (etat.duree > 0) charger_audio();
   brancher_flux();
+}
+
+function charger_audio() {
+  audio.src = "/api/audio?j=" + Date.now();
 }
 
 /* ------------------------------- SSE ------------------------------- */
@@ -221,18 +384,141 @@ function traiter(e) {
       break;
     case "langue": toast("Langue détectée : " + e.langue); break;
     case "lecture_prete":
-      audio.src = "/api/audio?j=" + Date.now();
+      charger_audio();
       $("#etat-lecture").hidden = true;
       break;
     case "fichier": etat.fichier = e.chemin; break;
     case "maj": maj_progression(e); break;
+    case "uness": maj_uness(e); break;
+    case "diapo": ajouter_intertitre(e); surligner_plan(e.n); break;
     case "etat": maj_etat(e); break;
   }
+}
+
+/* Phase 1 : récupération de l'audio du cours. Elle réutilise la même barre
+   d'avancement que la transcription — deux phases, un seul endroit à lire. */
+function maj_uness(e) {
+  const titre = $("#avancement-titre"), detail = $("#avancement-detail");
+  const barre = $("#barre-transcription");
+  switch (e.etape) {
+    case "connexion":
+      // Reçu pendant qu'on est encore sur l'accueil.
+      if (!$("#accueil").hidden) {
+        $("#uness-connexion").disabled = false;
+        if (e.ok) { etat.uness.cookies = true; verifier_session(); }
+        else { afficher_session(false, e.message); $("#uness-manuel").open = true; }
+      }
+      break;
+    case "analyse":
+      titre.textContent = "Lecture de la page du cours";
+      detail.textContent = e.message; barre.style.width = "2%";
+      break;
+    case "plan":
+      etat.nom = e.titre || etat.nom;
+      $("#titre-audio").textContent = etat.nom;
+      titre.textContent = "Récupération de l'audio";
+      detail.textContent = e.message;
+      break;
+    case "audio":
+      titre.textContent = "Récupération de l'audio";
+      detail.textContent =
+        `diapo ${e.fait}/${e.total}${e.cache ? " · déjà en cache" : ""}`;
+      barre.style.width = (85 * e.fait / Math.max(1, e.total)).toFixed(1) + "%";
+      break;
+    case "assemblage":
+      titre.textContent = "Assemblage de l'audio";
+      detail.textContent = e.total ? `diapo ${e.fait}/${e.total}` : e.message;
+      barre.style.width = "92%";
+      break;
+    case "session":
+      titre.textContent = "Session expirée";
+      detail.textContent = e.message;
+      break;
+    case "pret":
+      etat.duree = e.duree;
+      etat.chapitres = e.chapitres || [];
+      etat.nom = e.titre || etat.nom;
+      $("#titre-audio").textContent = etat.nom;
+      $("#temps").textContent = `00:00:00 / ${hhmmss(etat.duree)}`;
+      $("#piste").setAttribute("aria-valuemax", Math.floor(etat.duree));
+      construire_plan(e.sans_audio || []);
+      charger_audio();
+      barre.style.width = "0%";
+      titre.textContent = "Audio prêt — tu peux déjà écouter";
+      detail.textContent = e.message;
+      break;
+    case "info":
+      detail.textContent = e.message;
+      break;
+  }
+}
+
+/* ------------------------------- Plan ------------------------------- */
+
+function construire_plan(sans_audio) {
+  const liste = $("#plan-liste");
+  liste.innerHTML = "";
+  if (!etat.chapitres.length) { $("#plan").hidden = true; return; }
+  for (const c of etat.chapitres) {
+    const li = document.createElement("li");
+    li.className = "plan-item" + (c.sans_audio ? " muette" : "");
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "plan-lien";
+    b.innerHTML =
+      `<span class="plan-num">${c.n}</span>` +
+      `<span class="plan-nom"></span>` +
+      `<span class="plan-ts">${c.sans_audio ? "—" : hhmmss(c.debut)}</span>`;
+    b.querySelector(".plan-nom").textContent = c.titre || "(sans titre)";
+    if (c.sans_audio) {
+      b.disabled = true;
+      b.title = "Cette diapo n'a pas d'audio.";
+    } else {
+      b.addEventListener("click", () => aller_a(c.debut + 0.05, true));
+    }
+    li.appendChild(b);
+    liste.appendChild(li);
+    c.el = li;
+  }
+  const m = $("#plan-manquantes");
+  if (sans_audio && sans_audio.length) {
+    m.textContent = sans_audio.length === 1
+      ? `Diapo ${sans_audio[0]} sans audio.`
+      : `Diapos sans audio : ${sans_audio.join(", ")}.`;
+    m.hidden = false;
+  } else { m.hidden = true; }
+  $("#plan").hidden = false;
+}
+
+function surligner_plan(n) {
+  if (n === etat.diapo) return;
+  const avant = etat.chapitres.find((c) => c.n === etat.diapo);
+  if (avant && avant.el) avant.el.classList.remove("actif");
+  etat.diapo = n;
+  const c = etat.chapitres.find((x) => x.n === n);
+  if (!c || !c.el) return;
+  c.el.classList.add("actif");
+  if (etat.suivre) c.el.scrollIntoView({ block: "nearest" });
+}
+
+/* Diapo courante d'après la position de lecture (le surlignage suit
+   l'écoute, pas seulement l'écriture du texte). */
+function diapo_a(t) {
+  let courant = null;
+  for (const c of etat.chapitres) {
+    if (c.sans_audio) continue;
+    if (t >= c.debut - 0.001) courant = c.n; else break;
+  }
+  return courant;
 }
 
 function maj_etat(e) {
   etat.phase = e.etat;
   const titre = $("#avancement-titre"), detail = $("#avancement-detail");
+  if (e.etat === "recuperation") {
+    titre.textContent = "Récupération de l'audio du cours";
+    detail.textContent = e.message;
+  }
   if (e.etat === "modele") { titre.textContent = "Préparation du modèle"; detail.textContent = e.message; }
   if (e.etat === "transcription") { titre.textContent = "Transcription en cours"; }
   if (e.etat === "fini") {
@@ -248,9 +534,13 @@ function maj_etat(e) {
     $("#arreter").disabled = true;
   }
   if (e.etat === "erreur") {
-    titre.textContent = "La transcription s'est arrêtée";
+    titre.textContent = e.reconnexion
+      ? "Session expirée" : "La transcription s'est arrêtée";
     detail.textContent = e.message;
     $("#arreter").disabled = true;
+    // Session expirée : le cache garde tout ce qui est déjà récupéré, il
+    // suffit de se reconnecter et de relancer le même lien.
+    $("#revenir-accueil").hidden = !e.reconnexion;
   }
 }
 
@@ -268,6 +558,27 @@ function maj_progres(e) {
 /* ---------------------------- Transcript ---------------------------- */
 
 const transcript = $("#transcript");
+
+/* Intertitre de diapo dans le transcript. Le serveur envoie l'évènement
+   « diapo » juste avant le premier segment de cette diapo. */
+function ajouter_intertitre(e) {
+  $("#attente")?.remove();
+  const h = document.createElement("h2");
+  h.className = "intertitre";
+  h.dataset.debut = e.debut;
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "intertitre-lien";
+  b.title = "Écouter à partir d'ici";
+  b.textContent = `Diapo ${e.n}${e.titre ? " — " + e.titre : ""}`;
+  b.addEventListener("click", () => aller_a(e.debut + 0.05, true));
+  const ts = document.createElement("span");
+  ts.className = "intertitre-ts";
+  ts.textContent = e.ts;
+  h.appendChild(b);
+  h.appendChild(ts);
+  transcript.appendChild(h);
+}
 
 function ajouter_segment(e) {
   $("#attente")?.remove();
@@ -390,6 +701,7 @@ audio.addEventListener("timeupdate", () => {
   $("#piste").setAttribute("aria-valuenow", Math.floor(t));
   $("#piste").setAttribute("aria-valuetext", hhmmss(t));
   surligner(t);
+  if (etat.chapitres.length) surligner_plan(diapo_a(t));
 });
 audio.addEventListener("error", avertir_lecture);
 
@@ -467,12 +779,13 @@ addEventListener("click", (e) => {
 });
 menu.querySelectorAll("button").forEach((b) => b.addEventListener("click", async () => {
   menu.hidden = true;
-  const ts = b.dataset.ts;
-  const t = await fetch("/api/texte?ts=" + ts).then((r) => r.text());
+  const ts = b.dataset.ts, md = b.dataset.md === "1";
+  const t = await fetch(`/api/texte?ts=${ts}${md ? "&md=1" : ""}`).then((r) => r.text());
   const base = etat.nom.replace(/\.[^.]+$/, "") || "transcription";
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([t], { type: "text/plain;charset=utf-8" }));
-  a.download = base + (ts === "1" ? " (horodaté).txt" : ".txt");
+  a.href = URL.createObjectURL(new Blob([t], {
+    type: md ? "text/markdown;charset=utf-8" : "text/plain;charset=utf-8" }));
+  a.download = base + (md ? ".md" : ts === "1" ? " (horodaté).txt" : ".txt");
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }));
@@ -483,7 +796,7 @@ $("#arreter").addEventListener("click", () => {
 });
 
 $("#quitter").addEventListener("click", async () => {
-  const en_cours = ["modele", "transcription"].includes(etat.phase);
+  const en_cours = ["modele", "transcription", "recuperation"].includes(etat.phase);
   if (!confirm(en_cours
       ? "Fermer le Transcripteur ? La transcription en cours s'arrête ; le "
         + "texte déjà écrit reste dans le dossier Transcriptions."
@@ -497,8 +810,17 @@ $("#quitter").addEventListener("click", async () => {
     '</p></header></main>';
 });
 
+/* Reprise après expiration de session : on revient à l'accueil, le lien et
+   le cache sont toujours là, donc rien n'est retéléchargé. */
+$("#revenir-accueil").addEventListener("click", () => {
+  $("#travail").hidden = true;
+  $("#accueil").hidden = false;
+  $("#revenir-accueil").hidden = true;
+  choisir_source("uness");
+});
+
 $("#nouvelle").addEventListener("click", () => {
-  if (["modele", "transcription"].includes(etat.phase) &&
+  if (["modele", "transcription", "recuperation"].includes(etat.phase) &&
       !confirm("Une transcription est en cours. L'arrêter et en démarrer une autre ?")) return;
   fetch("/api/stop", { method: "POST" }).then(() => location.reload());
 });
@@ -555,7 +877,7 @@ $("#maj-verifier").addEventListener("click", () => {
 $("#maj-plus-tard").addEventListener("click", () => { bandeau.hidden = true; });
 
 $("#maj-installer").addEventListener("click", () => {
-  if (["modele", "transcription"].includes(etat.phase) &&
+  if (["modele", "transcription", "recuperation"].includes(etat.phase) &&
       !confirm("Une transcription est en cours. La mise à jour va l'arrêter. " +
                "Continuer ?")) return;
   $("#maj-installer").disabled = true;

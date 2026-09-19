@@ -113,6 +113,64 @@ code { font-family: var(--mono); font-size: .8125rem; }
 
 .sous-titre { margin: 0 0 2rem; color: var(--gris); max-width: 30rem; }
 
+/* Deux entrées, deux cartes de même poids : ni l'une ni l'autre n'est un
+   sous-menu de l'autre. */
+.sources {
+  display: grid; grid-template-columns: 1fr 1fr; gap: .75rem;
+  margin-bottom: 1.5rem;
+}
+.source {
+  display: grid; gap: .15rem; text-align: left;
+  border: 1.5px solid var(--trait); border-radius: var(--rayon);
+  background: var(--surface); padding: .9rem 1rem; cursor: pointer;
+}
+.source:hover { border-color: var(--gris); }
+.source[aria-selected="true"] { border-color: var(--accent); background: var(--accent-fond); }
+.source b { font-weight: 600; }
+.source .aide { margin-top: .15rem; }
+.ic-source {
+  width: 20px; height: 20px; fill: none; stroke: var(--gris);
+  stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+}
+.source[aria-selected="true"] .ic-source { stroke: var(--accent); }
+@media (max-width: 34rem) { .sources { grid-template-columns: 1fr; } }
+
+/* ---- Session UNESS ---- */
+input[type="url"], input[type="text"] {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--trait);
+  border-radius: var(--rayon);
+  padding: .5rem .6rem;
+  font-family: var(--mono); font-size: .875rem;
+}
+.session {
+  border: 1px solid var(--trait); border-radius: var(--rayon);
+  background: var(--surface); padding: .8rem 1rem; margin-top: 1.25rem;
+}
+.session-etat { display: flex; gap: .5rem; align-items: center; margin: 0 0 .6rem; font-size: .9375rem; }
+.session-actions { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+.session .aide { margin-top: .6rem; }
+.pastille {
+  flex: none; width: 9px; height: 9px; border-radius: 50%;
+  background: var(--trait); box-shadow: 0 0 0 2px var(--surface);
+}
+.pastille.ok { background: #2d7a42; }
+.pastille.ko { background: var(--gris); }
+@media (prefers-color-scheme: dark) { .pastille.ok { background: #64c07e; } }
+.session-actions .lien-bouton { margin-left: 0; }
+
+.repli { margin-top: 1.25rem; font-size: .9375rem; }
+.repli summary { cursor: pointer; color: var(--accent); }
+.repli > :not(summary) { margin-top: .7rem; }
+.guide { padding-left: 1.2rem; }
+.guide li { margin-bottom: .3rem; }
+kbd {
+  font-family: var(--mono); font-size: .75rem;
+  border: 1px solid var(--trait); border-bottom-width: 2px;
+  border-radius: 4px; padding: 0 .3rem;
+}
+
 .depot {
   border: 1.5px dashed var(--trait);
   border-radius: var(--rayon);
@@ -270,8 +328,64 @@ textarea { resize: vertical; }
 }
 .avancement .barre { max-width: 62rem; margin: 0 auto; }
 
-/* Le transcript : le héros de la page. */
+.avancement #revenir-accueil { display: block; max-width: 62rem; margin: .6rem auto 0; }
+
+/* Le transcript : le héros de la page.
+   Avec un cours UNESS, le plan s'installe dans une colonne à gauche ; sans
+   plan, le transcript reste exactement où il était. */
 .lecture { flex: 1; padding: 2rem 1rem 6rem; }
+.lecture:has(#plan:not([hidden])) {
+  display: grid;
+  grid-template-columns: minmax(0, 15rem) minmax(0, var(--mesure));
+  gap: 2.5rem; justify-content: center; align-items: start;
+}
+
+.plan {
+  position: sticky; top: 11rem;
+  max-height: calc(100vh - 14rem); overflow: auto;
+  font-size: .875rem;
+}
+.plan-titre { font-size: .8125rem; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--gris); margin: 0 0 .5rem; }
+.plan-liste { list-style: none; margin: 0; padding: 0; }
+.plan-lien {
+  display: grid; grid-template-columns: 1.6rem 1fr auto; gap: .5rem;
+  width: 100%; text-align: left; align-items: baseline;
+  background: none; border: 0; border-left: 3px solid transparent;
+  padding: .3rem .5rem; border-radius: 0 4px 4px 0; cursor: pointer;
+}
+.plan-lien:hover:not(:disabled) { background: var(--accent-fond); }
+.plan-item.actif .plan-lien {
+  background: var(--accent-fond); border-left-color: var(--accent); font-weight: 600;
+}
+.plan-item.muette .plan-lien { color: var(--gris); cursor: default; }
+.plan-num { font-family: var(--mono); font-size: .75rem; color: var(--gris); }
+.plan-ts { font-family: var(--mono); font-size: .75rem; color: var(--gris); }
+
+/* Intertitre de diapo dans le texte. */
+.intertitre {
+  font-family: var(--sans);
+  font-size: .9375rem; font-weight: 600;
+  display: flex; gap: .6rem; align-items: baseline;
+  margin: 1.8rem 0 .5rem; padding-bottom: .3rem;
+  border-bottom: 1px solid var(--trait);
+  scroll-margin-top: 10rem;
+}
+.intertitre:first-child { margin-top: 0; }
+.intertitre-lien {
+  background: none; border: 0; padding: 0; text-align: left;
+  font: inherit; color: inherit; cursor: pointer;
+}
+.intertitre-lien:hover { color: var(--accent); }
+.intertitre-ts { margin-left: auto; font-family: var(--mono);
+  font-size: .75rem; font-weight: 400; color: var(--gris); }
+
+@media (max-width: 62rem) {
+  .lecture:has(#plan:not([hidden])) { grid-template-columns: minmax(0, 1fr); }
+  .plan { position: static; max-height: 18rem; max-width: var(--mesure);
+    margin: 0 auto 1.5rem; width: 100%; }
+}
+
 .transcript {
   max-width: var(--mesure);
   margin: 0 auto;

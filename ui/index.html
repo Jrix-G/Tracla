@@ -30,7 +30,29 @@
       Rien n'est envoyé sur Internet.</p>
   </header>
 
+  <div class="sources" role="tablist" aria-label="D'où vient le cours ?">
+    <button type="button" id="onglet-fichier" class="source" role="tab"
+            aria-selected="true" aria-controls="source-fichier">
+      <svg viewBox="0 0 24 24" aria-hidden="true" class="ic-source">
+        <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5" />
+        <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+      </svg>
+      <b>Fichier audio</b>
+      <span class="aide">Un enregistrement déjà sur ton ordinateur.</span>
+    </button>
+    <button type="button" id="onglet-uness" class="source" role="tab"
+            aria-selected="false" aria-controls="source-uness">
+      <svg viewBox="0 0 24 24" aria-hidden="true" class="ic-source">
+        <path d="M10 13a4 4 0 0 0 5.66 0l3-3A4 4 0 0 0 13 4.34l-1.2 1.2"/>
+        <path d="M14 11a4 4 0 0 0-5.66 0l-3 3A4 4 0 0 0 11 19.66l1.2-1.2"/>
+      </svg>
+      <b>Cours UNESS (lien)</b>
+      <span class="aide">Colle l'adresse du cours : l'audio est récupéré tout seul.</span>
+    </button>
+  </div>
+
   <form id="formulaire" novalidate>
+    <div id="source-fichier" role="tabpanel" aria-labelledby="onglet-fichier">
     <div id="depot" class="depot" tabindex="0" role="button"
          aria-describedby="formats">
       <svg viewBox="0 0 24 24" aria-hidden="true" class="icone">
@@ -50,6 +72,51 @@
     </div>
 
     <div id="barre-upload" class="barre" hidden><span></span></div>
+    </div><!-- /source-fichier -->
+
+    <!-- ------------------------- Cours UNESS ------------------------- -->
+    <div id="source-uness" role="tabpanel" aria-labelledby="onglet-uness" hidden>
+      <label class="champ">
+        <span class="etiquette">Lien du cours</span>
+        <input type="url" id="uness-url" spellcheck="false"
+               placeholder="https://formation.uness.fr/formation/pluginfile.php/…/index.htm">
+        <span class="aide">Ouvre ton cours dans ton navigateur habituel et
+          copie l'adresse de la page du lecteur.</span>
+      </label>
+
+      <div class="session">
+        <p class="session-etat">
+          <span id="session-pastille" class="pastille"></span>
+          <span id="session-texte">Non connecté à UNESS</span>
+        </p>
+        <div class="session-actions">
+          <button type="button" id="uness-connexion" class="secondaire">Se connecter à UNESS</button>
+          <button type="button" id="uness-deconnexion" class="lien-bouton" hidden>Se déconnecter et effacer la session</button>
+        </div>
+        <p class="aide">Une fenêtre de navigateur s'ouvre : connecte-toi comme
+          d'habitude. Le Transcripteur ne voit jamais ton mot de passe et ne
+          l'enregistre nulle part. La connexion est mémorisée pour les fois
+          suivantes.</p>
+      </div>
+
+      <details id="uness-manuel" class="repli">
+        <summary>La fenêtre ne s'ouvre pas ? Coller le cookie à la main</summary>
+        <ol class="aide guide">
+          <li>Ouvre ton cours dans ton navigateur habituel, connecté.</li>
+          <li>Appuie sur <kbd>F12</kbd> pour ouvrir les outils de développement.</li>
+          <li>Onglet <b>Application</b> (Chrome/Edge) ou <b>Stockage</b> (Firefox),
+            puis <b>Cookies</b> → <code id="uness-domaine">formation.uness.fr</code>.</li>
+          <li>Trouve la ligne <code>MoodleSession</code> et copie sa <b>valeur</b>.</li>
+          <li>Colle-la ci-dessous.</li>
+        </ol>
+        <label class="champ">
+          <span class="visuellement-cache">Valeur du cookie de session</span>
+          <input type="text" id="uness-cookie" spellcheck="false"
+                 placeholder="MoodleSession=a1b2c3… ou juste a1b2c3…">
+        </label>
+        <button type="button" id="uness-cookie-ok" class="secondaire">Utiliser ce cookie</button>
+      </details>
+    </div><!-- /source-uness -->
 
     <div class="champs">
       <label class="champ">
@@ -93,6 +160,9 @@
 
     <p id="erreur-accueil" class="erreur" hidden></p>
     <button type="submit" id="lancer" class="principal" disabled>Lancer la transcription</button>
+    <p id="note-uness" class="note" hidden>Le Transcripteur utilise ta propre
+      session UNESS, un cours à la fois, à débit modéré. Il ne contourne aucun
+      contrôle d'accès.</p>
     <p class="note">Les textes sont enregistrés au fur et à mesure dans
       <code id="dossier-sortie"></code>.</p>
     <p class="note pied-version">
@@ -150,10 +220,17 @@
         <span id="avancement-detail" class="meta"></span>
       </div>
       <div class="barre"><span id="barre-transcription"></span></div>
+      <button type="button" id="revenir-accueil" class="principal compact" hidden>
+        Se reconnecter et reprendre</button>
     </section>
   </header>
 
   <main class="lecture">
+    <nav id="plan" class="plan" hidden aria-label="Plan du cours">
+      <h2 class="plan-titre">Plan du cours</h2>
+      <ol id="plan-liste" class="plan-liste"></ol>
+      <p id="plan-manquantes" class="aide" hidden></p>
+    </nav>
     <div id="transcript" class="transcript" aria-live="polite" aria-busy="true">
       <p class="attente" id="attente">Le texte apparaîtra ici, au fur et à mesure.
         Tu peux déjà écouter.</p>
@@ -174,6 +251,7 @@
         <div id="menu-telecharger" class="menu-liste" hidden>
           <button data-ts="1">Avec horodatages</button>
           <button data-ts="0">Texte seul</button>
+          <button data-ts="1" data-md="1">Markdown (.md)</button>
         </div>
       </div>
       <button id="arreter" class="secondaire danger">Arrêter</button>
