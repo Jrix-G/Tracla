@@ -195,8 +195,24 @@ XML.
 **Détection de session.** Moodle renvoie sa page de connexion en **200**, pas en
 401. Une réponse n'est donc acceptée que si son `Content-Type` est `audio/*`
 (ou un 206) ; du HTML qui parle de connexion vaut « session absente ». La
-fenêtre de connexion applique le même test, exécuté *depuis le navigateur*
-(mêmes cookies, mêmes en-têtes), et ne se ferme que quand il passe.
+fenêtre de connexion applique le même test et ne se ferme que quand il passe.
+
+**Le piège CORS du SSO.** Ce test doit passer par
+`contexte.request` (l'`APIRequestContext` de Playwright), **jamais** par un
+`fetch()` exécuté dans la page. Pendant une connexion fédérée, l'onglet se
+trouve sur le domaine du fournisseur d'identité ; un `fetch` vers
+`formation.uness.fr` depuis cet onglet est alors une requête *cross-origin*,
+que le navigateur bloque puisque Moodle n'envoie aucun en-tête CORS. La
+fenêtre ne pouvait donc jamais constater que la connexion avait abouti, et
+restait ouverte indéfiniment. Le contexte, lui, partage les cookies de la
+fenêtre sans être soumis à ces règles.
+
+Ce défaut était invisible tant que le faux serveur tenait sur une seule
+origine — c'est pour ça que `tests/faux_uness.py` lance désormais, avec
+`sso=True`, un **fournisseur d'identité sur un second port** et y laisse
+l'onglet. Le scénario B de `tests/uness_fenetre_exe.py` échoue sur l'ancien
+code (« toujours ouverte après 90 s ») et passe sur le nouveau : c'est un
+garde-fou, pas une décoration.
 
 **Assemblage.** Les octets des mp3 ne sont **jamais** concaténés : chaque
 fichier porte ses propres horodatages et un bloc Xing/LAME, et un tel collage
@@ -421,7 +437,7 @@ python app.py                              # démarre le serveur (note le port)
 python tests/parcours.py http://127.0.0.1:PORT --modele base
 python tests/uness_test.py                 # modules UNESS (--rapide : sans les 79 diapos)
 python tests/uness_parcours.py             # import UNESS bout en bout, par HTTP
-python tests/uness_fenetre_exe.py          # après un build : la fenêtre de connexion
+python tests/uness_fenetre_exe.py          # après un build : la fenêtre (2 scénarios)
 python tests/uness_fenetre_exe.py --source # la même, sans attendre un build
 python tests/bench.py audio.ogg base small large-v3-turbo --secondes 180
 python tests/smoke_exe.py                  # après un build, teste l'exe
@@ -478,11 +494,13 @@ Tout ceci a été exécuté réellement, pas seulement relu :
   faux cours **dit son propre numéro**, et le test vérifie que ce numéro tombe
   bien sous le bon intertitre pour les 9 diapos sonores ;
 - fenêtre de connexion **depuis l'exe construit**
-  (`tests/uness_fenetre_exe.py`) : 8 vérifications — Playwright démarre bien
-  depuis le bundle PyInstaller, Edge s'ouvre, une page de connexion en 200
-  n'est pas prise pour une session, la connexion est détectée dès que le
-  cookie arrive, les cookies remontent, le profil reste sur le disque, et
-  aucune valeur de cookie n'apparaît dans la sortie du processus ;
+  (`tests/uness_fenetre_exe.py`) : 16 vérifications sur deux scénarios —
+  Playwright démarre bien depuis le bundle PyInstaller, Edge s'ouvre, une page
+  de connexion en 200 n'est pas prise pour une session, la connexion est
+  détectée dès que le cookie arrive, les cookies remontent, le profil reste sur
+  le disque, et aucune valeur de cookie n'apparaît dans la sortie du processus.
+  Le **scénario B** rejoue un SSO : l'onglet reste sur un fournisseur
+  d'identité servi sur un autre port, et la fenêtre doit quand même conclure ;
 - interface réelle (navigateur, contre le faux serveur) : les deux entrées de
   l'accueil, le repli « coller le cookie », la récupération des 8 diapos avec
   la diapo 3 grisée dans le plan, la lecture possible **avant** la fin de la

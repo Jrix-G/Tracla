@@ -9,7 +9,12 @@ Imite ce qui compte vraiment :
   - et surtout : sans le bon cookie, une PAGE DE CONNEXION renvoyee en 200,
     jamais un 401, exactement comme Moodle.
 
-  python tests/faux_uness.py [--port 0] [--diapos 12] [--sans-audio 3,7]
+Avec sso=True, la page de connexion part sur un fournisseur d'identite servi
+sur un SECOND PORT, et l'onglet y reste. Sans ca, tout tenait sur une seule
+origine et le test ne pouvait pas voir qu'un fetch() lance depuis la page se
+fait bloquer par CORS pendant une connexion federee.
+
+  python tests/faux_uness.py [--port 0] [--diapos 12] [--sans-audio 3,7] [--sso]
 """
 
 import argparse
@@ -148,6 +153,47 @@ PAGE_LOGIN = """<!DOCTYPE html>
 </div></body></html>
 """
 
+# Variante SSO : Moodle renvoie sa page de connexion, qui part aussitot sur le
+# fournisseur d'identite -- sur une AUTRE ORIGINE. C'est le cas qui compte :
+# un fetch() execute dans cet onglet vers formation.uness.fr devient une
+# requete cross-origin, que le navigateur bloque faute d'en-tetes CORS.
+PAGE_LOGIN_SSO = """<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<title>UNESS : redirection</title>
+<meta http-equiv="refresh" content="0;url=%s">
+</head><body><div class="loginform">
+<p>Redirection vers la f&eacute;d&eacute;ration d'identit&eacute;&hellip;</p>
+<input name="password" type="password" hidden>
+</div></body></html>
+"""
+
+PAGE_IDP = """<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<title>F&eacute;d&eacute;ration d'identit&eacute;</title></head>
+<body><h1>Authentification</h1>
+<p>Double authentification en cours. Cette page reste ouverte&nbsp;: c'est
+exactement ce qui pi&egrave;ge un fetch() lanc&eacute; depuis l'onglet.</p>
+</body></html>
+"""
+
+
+class _Idp(BaseHTTPRequestHandler):
+    """Un fournisseur d'identite minimal, sur un autre port donc une autre
+    origine. Il ne fait rien d'autre que rester affiche."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        corps = PAGE_IDP.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(corps)))
+        self.end_headers()
+        self.wfile.write(corps)
+
 
 def page_index(diapos):
     """index.htm : un plan tronque a l'affichage (comme le vrai lecteur) et
@@ -219,7 +265,8 @@ class Faux(BaseHTTPRequestHandler):
 
     def repondre_login(self):
         """Comme Moodle : 200, du HTML, pas de 401."""
-        corps = PAGE_LOGIN.encode("utf-8")
+        corps = ((PAGE_LOGIN_SSO % self.server.idp_url) if self.server.idp_url
+                 else PAGE_LOGIN).encode("utf-8")
         self.send_response(200)
         # 'auto_connexion' simule l'utilisateur qui vient de s'identifier dans
         # la fenetre : le serveur pose le cookie, et la requete SUIVANTE passe.
@@ -345,7 +392,7 @@ class _Serveur(ThreadingHTTPServer):
 
 
 def demarrer(nb_diapos=12, sans_audio=(), port=0, dossier=None, bavard=False,
-             parole=False,
+             parole=False, sso=False,
              racine_url="/formation/pluginfile.php/116687/mod_resource/content/0/"):
     """Lance le faux serveur dans un thread. Renvoie (serveur, base_url)."""
     # Un dossier par serveur : sinon les mp3 d'un test precedent trainent et
@@ -379,6 +426,14 @@ def demarrer(nb_diapos=12, sans_audio=(), port=0, dossier=None, bavard=False,
     srv.valeur = VALEUR
     srv.exige_reconnexion = False
     srv.auto_connexion = False
+    srv.idp_url = None
+    srv.idp = None
+    if sso:
+        # Le fournisseur d'identite tourne sur un AUTRE port : autre origine.
+        srv.idp = _Serveur(("127.0.0.1", 0), _Idp)
+        srv.idp.daemon_threads = True
+        threading.Thread(target=srv.idp.serve_forever, daemon=True).start()
+        srv.idp_url = "http://127.0.0.1:%d/idp" % srv.idp.server_address[1]
     srv.echecs = {}
     srv.requetes = []
     srv.bavard = bavard
@@ -392,13 +447,18 @@ def main():
     ap.add_argument("--port", type=int, default=8777)
     ap.add_argument("--diapos", type=int, default=12)
     ap.add_argument("--sans-audio", default="")
+    ap.add_argument("--sso", action="store_true",
+                    help="page de connexion sur une autre origine")
     args = ap.parse_args()
     manquantes = tuple(int(x) for x in args.sans_audio.split(",") if x.strip())
-    srv, base = demarrer(args.diapos, manquantes, args.port, bavard=True)
+    srv, base = demarrer(args.diapos, manquantes, args.port, bavard=True,
+                         sso=args.sso)
     print("Faux UNESS : %sindex.htm" % base)
     print("Cookie attendu : %s=%s" % (COOKIE, VALEUR))
     print("Se 'connecter' : http://127.0.0.1:%d/login/index.php"
           % srv.server_address[1])
+    if srv.idp_url:
+        print("Fournisseur d'identite (autre origine) : %s" % srv.idp_url)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:

@@ -17,6 +17,7 @@ JSON sur sa sortie standard.
 """
 
 import json
+import re
 import os
 import subprocess
 import sys
@@ -159,25 +160,18 @@ def _ouvrir_fenetre(url, profil, url_test, sortie):
                     "message": "Fenetre fermee avant la connexion."}
         # A la toute premiere connexion on ne connait encore aucun mp3 : on ne
         # peut pas les lire sans etre identifie. La fenetre en trouve donc un
-        # elle-meme dans la page, puis le teste.
+        # elle-meme dans les donnees du lecteur, puis le teste.
         cible = url_test if (url_test or "").lower().endswith(".mp3") else None
         while time.time() < limite:
             if not contexte.pages:
                 break                      # l'utilisateur a ferme la fenetre
-            try:
+            if cible is None:
+                cible = _trouver_un_mp3(contexte, url)
                 if cible is None:
-                    cible = page.evaluate(_TROUVER_UN_MP3, url) or None
-                    if cible is None:
-                        time.sleep(1.5)
-                        continue
-                # La requete part du navigateur : memes cookies, meme TLS,
-                # memes en-tetes que ce que l'utilisateur voit.
-                reponse = page.evaluate(_TESTER_AUDIO, cible)
-            except Exception:
-                time.sleep(1.0)
-                continue
-            code, _, ctype = reponse.partition("|")
-            if code in ("200", "206") and ctype.lower().startswith("audio/"):
+                    time.sleep(1.5)
+                    continue
+            code, ctype, _ = _sonder(contexte, cible)
+            if code in (200, 206) and ctype.startswith("audio/"):
                 resultat = {"ok": True,
                             "cookies": _cookies_du_domaine(contexte, hote),
                             "message": "Connexion reussie."}
@@ -193,42 +187,64 @@ def _ouvrir_fenetre(url, profil, url_test, sortie):
         json.dump(resultat, f)
 
 
-# Cherche un nom de mp3 : d'abord dans la page, puis dans les fichiers de
-# donnees du lecteur. Renvoie l'URL complete, ou "" si la page recue est une
-# page de connexion (Moodle la renvoie en 200, il faut donc la reconnaitre au
-# contenu et pas au code HTTP).
-_TROUVER_UN_MP3 = """async (u) => {
-  const base = u.replace(/[^/]*$/, '');
-  const lire = async (lien) => {
-    try {
-      const r = await fetch(lien, {credentials: 'include'});
-      if (!r.ok) return null;
-      return await r.text();
-    } catch (e) { return null; }
-  };
-  const page = await lire(u);
-  if (page === null) return "";
-  if (/loginform|\\/login\\/index\\.php|SAMLRequest|name=["']password["']/i.test(page))
-    return "";
-  const chercher = (t) => (t || "").match(/[A-Za-z0-9_.\\-]+\\.mp3/);
-  let m = chercher(page);
-  if (!m) {
-    for (const c of ['data/presentation.xml', 'data/presentationData.js',
-                     'data/vt_data.js', 'data/slides.xml']) {
-      m = chercher(await lire(base + c));
-      if (m) break;
-    }
-  }
-  return m ? base + 'data/' + m[0].replace(/^.*\\//, '') : "";
-}"""
+def _sonder(contexte, url, plage=True):
+    """GET par le contexte du navigateur. Renvoie (code, content-type, debut).
 
-_TESTER_AUDIO = """async (u) => {
-  try {
-    const r = await fetch(u, {headers: {Range: 'bytes=0-1023'},
-                              credentials: 'include'});
-    return r.status + '|' + (r.headers.get('content-type') || '');
-  } catch (e) { return 'erreur|' + e; }
-}"""
+    Pourquoi pas un fetch() execute dans la page : pendant un SSO, l'onglet se
+    trouve sur le domaine de la federation d'identite, et un fetch vers
+    formation.uness.fr devient une requete cross-origin que le navigateur
+    bloque, Moodle n'envoyant aucun en-tete CORS. La fenetre ne pourrait alors
+    jamais constater que la connexion a abouti. Le contexte, lui, partage les
+    cookies de la fenetre sans etre soumis a ces regles.
+    """
+    entetes = {"Range": "bytes=0-1023"} if plage else {}
+    try:
+        r = contexte.request.get(url, headers=entetes, timeout=25000)
+    except Exception:
+        return None, "", b""
+    ctype = (r.headers.get("content-type") or "").lower()
+    try:
+        corps = r.body()[:8192]
+    except Exception:
+        corps = b""
+    return r.status, ctype, corps
+
+
+_MP3_DANS_TEXTE = re.compile(r"[A-Za-z0-9_.\-]+\.mp3", re.IGNORECASE)
+_SENT_LE_LOGIN = re.compile(
+    rb"loginform|/login/index\.php|SAMLRequest|name=[\"']password[\"']",
+    re.IGNORECASE)
+
+# Les fichiers de donnees ou chercher un nom de mp3, en plus de la page.
+_SOURCES = ("data/presentation.xml", "data/presentationData.js",
+            "data/vt_data.js", "data/slides.xml")
+
+
+def _trouver_un_mp3(contexte, url):
+    """Un mp3 du cours, ou None tant qu'on ne voit qu'une page de connexion.
+
+    Moodle renvoie sa page de connexion en 200 : on la reconnait a son
+    contenu, jamais au code HTTP.
+    """
+    base = url.rsplit("/", 1)[0] + "/"
+
+    def lire(lien):
+        code, _, corps = _sonder(contexte, lien, plage=False)
+        if code is None or code >= 400:
+            return None
+        return corps
+
+    corps = lire(url)
+    if corps is None or _SENT_LE_LOGIN.search(corps):
+        return None
+    for source in (corps,) + tuple(_SOURCES):
+        texte = source if isinstance(source, bytes) else lire(base + source)
+        if not texte:
+            continue
+        m = _MP3_DANS_TEXTE.search(texte.decode("utf-8", "replace"))
+        if m:
+            return base + "data/" + m.group(0).rsplit("/", 1)[-1]
+    return None
 
 
 def _cookies_du_domaine(contexte, hote=DOMAINE):

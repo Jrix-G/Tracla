@@ -50,18 +50,21 @@ def verifie(nom, condition, detail=""):
     return bool(condition)
 
 
-def main():
-    lancement = ([sys.executable, os.path.join(RACINE, "app.py")] if EXE is None
-                 else [EXE])
-    if EXE is not None and not os.path.isfile(EXE):
-        print("[KO] executable introuvable : %s\n"
-              "     Lance build.bat d'abord." % EXE)
-        return 1
+def scenario(lancement, sso, etiquette):
+    """Un aller-retour complet de la fenetre de connexion.
 
+    'sso=True' fait repondre au faux Moodle une page de connexion qui part
+    aussitot sur un fournisseur d'identite servi sur un AUTRE PORT, donc une
+    autre origine -- et l'onglet y reste, comme pendant une vraie double
+    authentification. C'est le cas qui a revele le defaut : un fetch() lance
+    depuis cet onglet vers le cours est une requete cross-origin, que le
+    navigateur bloque puisque Moodle n'envoie aucun en-tete CORS. La fenetre
+    ne pouvait alors jamais constater que la connexion avait abouti.
+    """
     travail = tempfile.mkdtemp(prefix="uness-fenetre-")
     profil = os.path.join(travail, "profil")
     sortie = os.path.join(travail, "resultat.json")
-    srv, base = faux_uness.demarrer(nb_diapos=4)
+    srv, base = faux_uness.demarrer(nb_diapos=4, sso=sso)
     url_index = base + "index.htm"
     # Cas de la PREMIERE connexion : on ne connait encore aucun mp3 (il faut
     # etre identifie pour lire la page qui les liste). La fenetre doit donc en
@@ -71,12 +74,15 @@ def main():
     if "--mp3-connu" in sys.argv:
         url_test = base + "data/%s1.mp3" % faux_uness.PREFIXE
 
+    print("\n===== %s =====" % etiquette)
     print("Faux UNESS : %s" % url_index)
+    if sso:
+        print("Fournisseur d'identite (autre origine) : %s" % srv.idp_url)
     print("Une fenetre Edge va s'ouvrir. Ne la touche pas : le test simule "
-          "la connexion tout seul.\n")
+          "la connexion tout seul.")
 
     try:
-        print("[1] Lancement de la fenetre depuis l'exe")
+        print("\n[1] Lancement de la fenetre")
         debut = time.time()
         proc = subprocess.Popen(
             lancement + ["--fenetre-connexion", url_index, profil,
@@ -133,7 +139,24 @@ def main():
 
     finally:
         srv.shutdown()
+        if getattr(srv, "idp", None):
+            srv.idp.shutdown()
         shutil.rmtree(travail, ignore_errors=True)
+
+
+def main():
+    lancement = ([sys.executable, os.path.join(RACINE, "app.py")] if EXE is None
+                 else [EXE])
+    if EXE is not None and not os.path.isfile(EXE):
+        print("[KO] executable introuvable : %s\n"
+              "     Lance build.bat d'abord." % EXE)
+        return 1
+    origine = "le script Python" if EXE is None else "l'EXE construit"
+    print("Fenetre de connexion, depuis %s." % origine)
+
+    scenario(lancement, False, "A. Connexion sur une seule origine")
+    scenario(lancement, True, "B. SSO : l'onglet reste sur le fournisseur "
+                              "d'identite (autre origine)")
 
     print("\n%d reussis, %d echoues" % (len(OK), len(KO)))
     if KO:
