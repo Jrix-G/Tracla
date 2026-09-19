@@ -7,7 +7,7 @@ tokenizers==0.23.2
 huggingface-hub==1.32.0
 requests==2.32.5          # requis par faster-whisper, plus tire par hub 1.x
 tqdm==4.70.1
-numpy==2.5.3
+numpy==2.4.6            # derniere version compatible Python 3.11
 av==13.1.0                # decodage/transcodage audio : embarque ffmpeg
 flask==3.1.0
 waitress==3.0.2           # serveur WSGI multi-thread (pas le serveur de dev)

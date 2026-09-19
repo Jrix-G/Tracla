@@ -21,11 +21,28 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Sans ErrorActionPreference, PowerShell garde le code de sortie de la
+      # DERNIERE commande : un pip install rate passe alors pour un succes, et
+      # PyInstaller construit un exe vide.
       - name: Installer les dépendances
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE) { throw "Mise a jour de pip echouee" }
           pip install -r requirements.txt
+          if ($LASTEXITCODE) { throw "Installation des dependances echouee" }
           pip install pyinstaller==6.11.1
+          if ($LASTEXITCODE) { throw "Installation de PyInstaller echouee" }
+
+      # Garde-fou : si une dependance native manque, on le sait ici et pas
+      # trois etapes plus loin dans un exe qui ne demarre pas.
+      - name: Vérifier que les dépendances sont importables
+        shell: pwsh
+        run: |
+          python -c "import av, ctranslate2, faster_whisper, onnxruntime, tokenizers, numpy, flask, waitress; print('imports OK')"
+          if ($LASTEXITCODE) { throw "Une dependance manque" }
+          python -c "import faster_whisper, os; d=os.path.join(os.path.dirname(faster_whisper.__file__),'assets'); print('assets VAD :', os.listdir(d))"
 
       # Sur un tag v1.2.3, la version est embarquee dans l'exe : c'est elle
       # que l'application compare a la derniere release publiee. Sur une
