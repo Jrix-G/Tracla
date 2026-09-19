@@ -70,6 +70,7 @@ jobs:
             --collect-submodules waitress `
             --hidden-import waitress `
             --hidden-import flask `
+            --exclude-module hf_xet `
             --exclude-module torch `
             --exclude-module tkinter `
             --exclude-module matplotlib `
@@ -80,6 +81,17 @@ jobs:
         run: python tests/smoke_exe.py
         env:
           PYTHONIOENCODING: utf-8
+
+      # Le test de fumee telecharge un modele DANS le dossier de l'exe (le
+      # cache est volontairement a cote du binaire). Sans ce nettoyage, le zip
+      # publie embarquerait 140 Mo de modele de test.
+      - name: Nettoyer les traces du test
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($p in "dist/Transcripteur/modeles", "dist/Transcripteur/reglages.json") {
+            if (Test-Path $p) { Remove-Item -Recurse -Force $p; "supprime : $p" }
+          }
 
       # Meme si le test de fumee echoue, on veut connaitre le poids et garder
       # la sortie de l'exe : c'est ce qui permet de diagnostiquer.

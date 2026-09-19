@@ -68,6 +68,7 @@ echo [5/5] Construction de l'executable...
   --collect-submodules waitress ^
   --hidden-import waitress ^
   --hidden-import flask ^
+  --exclude-module hf_xet ^
   --exclude-module torch ^
   --exclude-module tkinter ^
   --exclude-module matplotlib ^
