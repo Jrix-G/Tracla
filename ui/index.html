@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transcripteur</title>
+<link rel="stylesheet" href="/ui/style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+
+<!-- ============================ ACCUEIL ============================ -->
+<main id="accueil" class="page">
+  <header class="entete-accueil">
+    <h1>Transcripteur</h1>
+    <p class="sous-titre">Transcris tes cours en texte, sur ton ordinateur.
+      Rien n'est envoyé sur Internet.</p>
+  </header>
+
+  <form id="formulaire" novalidate>
+    <div id="depot" class="depot" tabindex="0" role="button"
+         aria-describedby="formats">
+      <svg viewBox="0 0 24 24" aria-hidden="true" class="icone">
+        <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5" />
+        <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+      </svg>
+      <p class="depot-titre">Glisse ton fichier audio ici</p>
+      <p class="depot-aide">ou <span class="lien">parcourir tes fichiers</span></p>
+      <p id="formats" class="formats">mp3, m4a, wav, ogg, flac, aac, wma, mp4, mkv, webm</p>
+      <input type="file" id="fichier" accept=".mp3,.m4a,.wav,.ogg,.flac,.aac,.wma,.mp4,.mkv,.webm" hidden>
+    </div>
+
+    <div id="fichier-choisi" class="fichier-choisi" hidden>
+      <span id="fichier-nom"></span>
+      <span id="fichier-duree" class="meta"></span>
+      <button type="button" id="changer" class="lien-bouton">Changer</button>
+    </div>
+
+    <div id="barre-upload" class="barre" hidden><span></span></div>
+
+    <div class="champs">
+      <label class="champ">
+        <span class="etiquette">Langue</span>
+        <select id="langue">
+          <option value="fr" selected>Français</option>
+          <option value="">Détection automatique</option>
+          <option value="en">Anglais</option>
+          <option value="es">Espagnol</option>
+          <option value="de">Allemand</option>
+          <option value="it">Italien</option>
+          <option value="pt">Portugais</option>
+          <option value="ar">Arabe</option>
+          <option value="nl">Néerlandais</option>
+          <option value="ru">Russe</option>
+          <option value="zh">Chinois</option>
+        </select>
+      </label>
+
+      <fieldset class="champ qualite">
+        <legend class="etiquette">Qualité</legend>
+        <div id="qualites"></div>
+      </fieldset>
+
+      <label class="champ case">
+        <input type="checkbox" id="hesitations" checked>
+        <span>
+          <span class="etiquette-inline">Garder les hésitations</span>
+          <span class="aide">Conserve les « euh », « ben », les répétitions.
+            Utile si tu reformules toi-même ensuite.</span>
+        </span>
+      </label>
+
+      <label class="champ">
+        <span class="etiquette">Vocabulaire du cours <span class="meta">(optionnel)</span></span>
+        <textarea id="vocabulaire" rows="2"
+          placeholder="Noms propres et termes techniques, séparés par des virgules : Kelsen, jus cogens, arrêt Nicolo"></textarea>
+        <span class="aide">Aide la transcription à bien orthographier ces mots.</span>
+      </label>
+    </div>
+
+    <p id="erreur-accueil" class="erreur" hidden></p>
+    <button type="submit" id="lancer" class="principal" disabled>Lancer la transcription</button>
+    <p class="note">Les textes sont enregistrés au fur et à mesure dans
+      <code id="dossier-sortie"></code>.</p>
+  </form>
+</main>
+
+<!-- ========================= TRANSCRIPTION ========================= -->
+<div id="travail" class="page" hidden>
+  <header class="lecteur" id="lecteur">
+    <div class="lecteur-haut">
+      <button id="jouer" class="rond" aria-label="Lecture / pause">
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="ic-play"><path d="M8 5l11 7-11 7z"/></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="ic-pause" hidden><path d="M7 4h4v16H7zM13 4h4v16h-4z"/></svg>
+      </button>
+      <div class="lecteur-corps">
+        <div class="titre-ligne">
+          <span id="titre-audio" class="titre-audio"></span>
+          <span id="temps" class="temps">00:00:00 / 00:00:00</span>
+        </div>
+        <div id="piste" class="piste" role="slider" tabindex="0"
+             aria-label="Position dans l'audio" aria-valuemin="0" aria-valuenow="0">
+          <div id="piste-transcrite" class="piste-transcrite"></div>
+          <div id="piste-lue" class="piste-lue"></div>
+          <div id="tete" class="tete"></div>
+        </div>
+      </div>
+      <div class="lecteur-boutons">
+        <button id="recul" class="petit" title="Reculer de 10 s">−10 s</button>
+        <button id="avance" class="petit" title="Avancer de 10 s">+10 s</button>
+        <label class="vitesse">
+          <span class="visuellement-cache">Vitesse de lecture</span>
+          <select id="vitesse">
+            <option value="0.75">0,75×</option>
+            <option value="1" selected>1×</option>
+            <option value="1.25">1,25×</option>
+            <option value="1.5">1,5×</option>
+            <option value="1.75">1,75×</option>
+            <option value="2">2×</option>
+          </select>
+        </label>
+      </div>
+    </div>
+    <p id="etat-lecture" class="etat-lecture" hidden></p>
+
+    <section class="avancement" id="avancement">
+      <div class="avancement-texte">
+        <strong id="avancement-titre">Préparation…</strong>
+        <span id="avancement-detail" class="meta"></span>
+      </div>
+      <div class="barre"><span id="barre-transcription"></span></div>
+    </section>
+  </header>
+
+  <main class="lecture">
+    <div id="transcript" class="transcript" aria-live="polite" aria-busy="true">
+      <p class="attente" id="attente">Le texte apparaîtra ici, au fur et à mesure.
+        Tu peux déjà écouter.</p>
+    </div>
+  </main>
+
+  <button id="revenir" class="revenir" hidden>Revenir à la lecture</button>
+
+  <footer class="actions">
+    <label class="suivre">
+      <input type="checkbox" id="suivre" checked>
+      <span>Suivre la lecture</span>
+    </label>
+    <div class="actions-droite">
+      <button id="copier" class="secondaire">Copier tout</button>
+      <div class="menu">
+        <button id="telecharger" class="secondaire" aria-haspopup="true" aria-expanded="false">Télécharger .txt</button>
+        <div id="menu-telecharger" class="menu-liste" hidden>
+          <button data-ts="1">Avec horodatages</button>
+          <button data-ts="0">Texte seul</button>
+        </div>
+      </div>
+      <button id="arreter" class="secondaire danger">Arrêter</button>
+      <button id="nouvelle" class="secondaire">Nouvelle transcription</button>
+      <button id="quitter" class="secondaire">Quitter</button>
+    </div>
+  </footer>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+<audio id="audio" preload="metadata"></audio>
+<script src="/ui/app.js"></script>
+</body>
+</html>

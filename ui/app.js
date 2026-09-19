@@ -1,0 +1,503 @@
+/* Transcripteur — interface. Aucun framework, aucune ressource externe. */
+"use strict";
+
+const $ = (s) => document.querySelector(s);
+const audio = $("#audio");
+
+const etat = {
+  segments: [],      // {debut, fin, ts, texte, el}
+  recu: 0,           // index du dernier événement durable reçu (reprise SSE)
+  duree: 0,
+  nom: "",
+  actif: -1,
+  suivre: true,
+  phase: "repos",
+  source: null,      // EventSource
+  modeles: {},
+  coeurs: 4,
+};
+
+/* Vitesses en « × temps réel » ramenées à 4 cœurs, int8. base et small sont
+   mesurés (voir le README) ; turbo et medium sont estimés à partir de leur
+   taille relative. Volontairement prudentes : mieux vaut aller plus vite que
+   l'estimation affichée. */
+const VITESSES = { "base": 4.5, "small": 1.9, "large-v3-turbo": 0.9, "medium": 0.6 };
+const ORDRE = ["base", "small", "large-v3-turbo", "medium"];
+const DESCRIPTIONS = {
+  "base": "Suffisant pour retrouver le fil. Quelques mots approximatifs.",
+  "small": "Le meilleur compromis pour un cours de plusieurs heures.",
+  "large-v3-turbo": "Presque aussi précis que le plus gros modèle, bien plus rapide.",
+  "medium": "Le plus fidèle sur les termes techniques, mais très lent sur un long cours.",
+};
+
+/* ------------------------------ Outils ------------------------------ */
+
+function hhmmss(s) {
+  s = Math.max(0, Math.floor(s || 0));
+  const h = String(Math.floor(s / 3600)).padStart(2, "0");
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+  return `${h}:${m}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function duree_humaine(s) {
+  if (s < 60) return `${Math.round(s)} s`;
+  if (s < 3600) return `${Math.round(s / 60)} min`;
+  const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+  return m ? `${h} h ${m} min` : `${h} h`;
+}
+
+let toast_timer;
+function toast(msg) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.hidden = false;
+  clearTimeout(toast_timer);
+  toast_timer = setTimeout(() => { t.hidden = true; }, 2600);
+}
+
+function erreur_accueil(msg) {
+  const e = $("#erreur-accueil");
+  e.textContent = msg;
+  e.hidden = !msg;
+}
+
+/* ---------------------------- Démarrage ---------------------------- */
+
+fetch("/api/config").then((r) => r.json()).then((c) => {
+  etat.modeles = c.modeles;
+  etat.coeurs = c.coeurs || 4;
+  $("#dossier-sortie").textContent = c.dossier_sortie;
+  construire_qualites();
+  if (["modele", "transcription", "fini", "arrete", "erreur"].includes(c.etat)) {
+    // Reprise après un rechargement de page : on retrouve le travail en cours.
+    etat.nom = c.nom; etat.duree = c.duree;
+    passer_en_travail();
+  }
+});
+
+function construire_qualites() {
+  const boite = $("#qualites");
+  boite.innerHTML = "";
+  for (const nom of ORDRE) {
+    const m = etat.modeles[nom];
+    if (!m) continue;
+    const facteur = (VITESSES[nom] || 1) * Math.min(2, Math.max(0.5, etat.coeurs / 4));
+    const pour_1h = 3600 / facteur;
+    const l = document.createElement("label");
+    l.className = "option-qualite";
+    l.innerHTML = `
+      <input type="radio" name="modele" value="${nom}" ${nom === "small" ? "checked" : ""}>
+      <span>
+        <b>${m.label}</b>${nom === "small" ? ' <span class="reco">· recommandé</span>' : ""}
+        <span class="aide">${DESCRIPTIONS[nom]}</span>
+        <span class="aide">Téléchargement ${m.taille} (une seule fois) ·
+          environ ${duree_humaine(pour_1h)} pour 1 h d'audio sur ton PC
+          (${etat.coeurs} cœurs)</span>
+      </span>`;
+    boite.appendChild(l);
+  }
+}
+
+/* ------------------------------ Dépôt ------------------------------ */
+
+const depot = $("#depot");
+const input_fichier = $("#fichier");
+let fichier_pret = false;
+
+depot.addEventListener("click", () => input_fichier.click());
+depot.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input_fichier.click(); }
+});
+["dragenter", "dragover"].forEach((t) =>
+  depot.addEventListener(t, (e) => { e.preventDefault(); depot.classList.add("survol"); }));
+["dragleave", "drop"].forEach((t) =>
+  depot.addEventListener(t, (e) => { e.preventDefault(); depot.classList.remove("survol"); }));
+depot.addEventListener("drop", (e) => {
+  const f = e.dataTransfer.files[0];
+  if (f) envoyer(f);
+});
+input_fichier.addEventListener("change", () => {
+  if (input_fichier.files[0]) envoyer(input_fichier.files[0]);
+});
+$("#changer").addEventListener("click", () => input_fichier.click());
+
+function envoyer(fichier) {
+  erreur_accueil("");
+  fichier_pret = false;
+  $("#lancer").disabled = true;
+  $("#fichier-choisi").hidden = false;
+  $("#fichier-nom").textContent = fichier.name;
+  $("#fichier-duree").textContent = "envoi en cours…";
+  const barre = $("#barre-upload");
+  barre.hidden = false;
+
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/upload");
+  // Les en-têtes HTTP ne supportent que le latin-1 : un nom comme
+  // « Cours de droit – séance n°3 (été).mp3 » doit être encodé en pourcent.
+  xhr.setRequestHeader("X-Nom-Fichier", encodeURIComponent(fichier.name));
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) {
+      barre.firstElementChild.style.width = (100 * e.loaded / e.total) + "%";
+    }
+  };
+  xhr.onload = () => {
+    barre.hidden = true;
+    let r = {};
+    try { r = JSON.parse(xhr.responseText); } catch (_) {}
+    if (xhr.status !== 200) {
+      erreur_accueil(r.erreur || "L'envoi du fichier a échoué. Réessaie.");
+      $("#fichier-choisi").hidden = true;
+      return;
+    }
+    etat.nom = r.nom; etat.duree = r.duree;
+    $("#fichier-duree").textContent = duree_humaine(r.duree);
+    fichier_pret = true;
+    $("#lancer").disabled = false;
+  };
+  xhr.onerror = () => {
+    barre.hidden = true;
+    erreur_accueil("L'envoi du fichier a échoué. Vérifie que le fichier " +
+                   "existe toujours, puis réessaie.");
+  };
+  xhr.send(fichier);
+}
+
+/* ---------------------------- Lancement ---------------------------- */
+
+$("#formulaire").addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (!fichier_pret) { erreur_accueil("Choisis d'abord un fichier audio."); return; }
+  const corps = {
+    modele: document.querySelector('input[name="modele"]:checked').value,
+    langue: $("#langue").value,
+    hesitations: $("#hesitations").checked,
+    vocabulaire: $("#vocabulaire").value,
+  };
+  $("#lancer").disabled = true;
+  fetch("/api/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(corps),
+  }).then((r) => r.json()).then((r) => {
+    if (r.erreur) { erreur_accueil(r.erreur); $("#lancer").disabled = false; return; }
+    passer_en_travail();
+  });
+});
+
+function passer_en_travail() {
+  $("#accueil").hidden = true;
+  $("#travail").hidden = false;
+  $("#titre-audio").textContent = etat.nom;
+  $("#temps").textContent = `00:00:00 / ${hhmmss(etat.duree)}`;
+  $("#piste").setAttribute("aria-valuemax", Math.floor(etat.duree));
+  audio.src = "/api/audio?j=" + Date.now();
+  brancher_flux();
+}
+
+/* ------------------------------- SSE ------------------------------- */
+
+function brancher_flux() {
+  if (etat.source) etat.source.close();
+  const s = new EventSource("/api/stream?depuis=" + etat.recu);
+  etat.source = s;
+  s.onmessage = (e) => traiter(JSON.parse(e.data));
+  s.onerror = () => {
+    // EventSource se reconnecte seul ; on repart au bon index.
+    if (s.readyState === EventSource.CLOSED) setTimeout(brancher_flux, 1500);
+  };
+}
+
+function traiter(e) {
+  if (typeof e.i === "number") etat.recu = e.i + 1;
+  switch (e.type) {
+    case "segment": ajouter_segment(e); break;
+    case "progres": maj_progres(e); break;
+    case "telechargement":
+      $("#avancement-titre").textContent = "Téléchargement du modèle";
+      $("#avancement-detail").textContent =
+        `${e.pct.toFixed(0)} % — une seule fois, ensuite l'app marche hors ligne`;
+      $("#barre-transcription").style.width = e.pct + "%";
+      break;
+    case "langue": toast("Langue détectée : " + e.langue); break;
+    case "lecture_prete":
+      audio.src = "/api/audio?j=" + Date.now();
+      $("#etat-lecture").hidden = true;
+      break;
+    case "fichier": etat.fichier = e.chemin; break;
+    case "etat": maj_etat(e); break;
+  }
+}
+
+function maj_etat(e) {
+  etat.phase = e.etat;
+  const titre = $("#avancement-titre"), detail = $("#avancement-detail");
+  if (e.etat === "modele") { titre.textContent = "Préparation du modèle"; detail.textContent = e.message; }
+  if (e.etat === "transcription") { titre.textContent = "Transcription en cours"; }
+  if (e.etat === "fini") {
+    titre.textContent = "Transcription terminée";
+    detail.textContent = etat.fichier ? "Enregistrée dans " + etat.fichier : "";
+    $("#barre-transcription").style.width = "100%";
+    $("#transcript").setAttribute("aria-busy", "false");
+    $("#arreter").disabled = true;
+  }
+  if (e.etat === "arrete") {
+    titre.textContent = "Transcription arrêtée";
+    detail.textContent = e.message;
+    $("#arreter").disabled = true;
+  }
+  if (e.etat === "erreur") {
+    titre.textContent = "La transcription s'est arrêtée";
+    detail.textContent = e.message;
+    $("#arreter").disabled = true;
+  }
+}
+
+function maj_progres(e) {
+  etat.duree = e.duree || etat.duree;
+  const pct = etat.duree ? 100 * e.transcrit / etat.duree : 0;
+  $("#barre-transcription").style.width = pct.toFixed(1) + "%";
+  $("#piste-transcrite").style.width = pct.toFixed(1) + "%";
+  $("#avancement-titre").textContent = "Transcription en cours";
+  $("#avancement-detail").textContent =
+    `${hhmmss(e.transcrit)} sur ${hhmmss(etat.duree)} · ${e.vitesse.toFixed(1)}× temps réel` +
+    (e.restant > 0 ? ` · encore ${duree_humaine(e.restant)}` : "");
+}
+
+/* ---------------------------- Transcript ---------------------------- */
+
+const transcript = $("#transcript");
+
+function ajouter_segment(e) {
+  $("#attente")?.remove();
+  const p = document.createElement("p");
+  p.className = "segment neuf";
+  p.dataset.debut = e.debut;
+  const b = document.createElement("button");
+  b.className = "horodatage";
+  b.type = "button";
+  b.textContent = e.ts;
+  b.title = "Écouter à partir d'ici";
+  b.addEventListener("click", () => aller_a(e.debut, true));
+  p.appendChild(b);
+  p.appendChild(document.createTextNode(e.texte));
+  transcript.appendChild(p);
+  setTimeout(() => p.classList.remove("neuf"), 400);
+  etat.segments.push({ debut: e.debut, fin: e.fin, el: p });
+}
+
+function segment_a(t) {
+  const s = etat.segments;
+  let lo = 0, hi = s.length - 1, res = -1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+    if (s[m].debut <= t) { res = m; lo = m + 1; } else { hi = m - 1; }
+  }
+  return res >= 0 && t <= s[res].fin + 1.5 ? res : res;
+}
+
+function surligner(t) {
+  const i = segment_a(t);
+  if (i === etat.actif) return;
+  if (etat.actif >= 0) etat.segments[etat.actif]?.el.classList.remove("actif");
+  etat.actif = i;
+  if (i < 0) return;
+  const el = etat.segments[i].el;
+  el.classList.add("actif");
+  if (etat.suivre) {
+    defilement_auto = true;
+    el.scrollIntoView({ block: "center",
+      behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+    clearTimeout(fin_defilement);
+    fin_defilement = setTimeout(() => { defilement_auto = false; }, 900);
+  }
+}
+
+/* Si l'utilisateur scrolle à la main, on coupe le suivi proprement.
+   On écoute l'intention (molette, doigt, touches de défilement) et non
+   l'évènement « scroll » : le défilement fluide déclenché par le suivi
+   lui-même en émet des dizaines et couperait le suivi tout seul. */
+let defilement_auto = false, fin_defilement;
+
+function couper_suivi() {
+  if (!etat.suivre || $("#travail").hidden) return;
+  etat.suivre = false;
+  $("#suivre").checked = false;
+  $("#revenir").hidden = false;
+}
+
+addEventListener("wheel", couper_suivi, { passive: true });
+addEventListener("touchmove", couper_suivi, { passive: true });
+addEventListener("keydown", (e) => {
+  if (e.target.matches("input, textarea, select")) return;
+  if (["PageUp", "PageDown", "Home", "End", "ArrowUp", "ArrowDown"].includes(e.key)) {
+    couper_suivi();
+  }
+});
+
+$("#suivre").addEventListener("change", (e) => {
+  etat.suivre = e.target.checked;
+  $("#revenir").hidden = etat.suivre;
+  if (etat.suivre) recentrer();
+});
+$("#revenir").addEventListener("click", () => {
+  etat.suivre = true;
+  $("#suivre").checked = true;
+  $("#revenir").hidden = true;
+  recentrer();
+});
+function recentrer() {
+  if (etat.actif >= 0) {
+    defilement_auto = true;
+    etat.segments[etat.actif].el.scrollIntoView({ block: "center", behavior: "smooth" });
+    clearTimeout(fin_defilement);
+    fin_defilement = setTimeout(() => { defilement_auto = false; }, 900);
+  }
+}
+
+/* ------------------------------ Lecteur ------------------------------ */
+
+function aller_a(t, jouer) {
+  t = Math.max(0, Math.min(t, etat.duree));
+  const faire = () => {
+    audio.currentTime = t;
+    if (jouer) audio.play().catch(() => {});
+  };
+  if (audio.readyState === 0) {
+    audio.addEventListener("loadedmetadata", faire, { once: true });
+    audio.load();
+  } else faire();
+  surligner(t);
+}
+
+$("#jouer").addEventListener("click", () => {
+  if (audio.paused) audio.play().catch(avertir_lecture); else audio.pause();
+});
+audio.addEventListener("play", () => {
+  $(".ic-play").hidden = true; $(".ic-pause").hidden = false;
+});
+audio.addEventListener("pause", () => {
+  $(".ic-play").hidden = false; $(".ic-pause").hidden = true;
+});
+audio.addEventListener("timeupdate", () => {
+  const t = audio.currentTime;
+  const d = etat.duree || audio.duration || 0;
+  $("#temps").textContent = `${hhmmss(t)} / ${hhmmss(d)}`;
+  const pct = d ? 100 * t / d : 0;
+  $("#piste-lue").style.width = pct + "%";
+  $("#tete").style.left = pct + "%";
+  $("#piste").setAttribute("aria-valuenow", Math.floor(t));
+  $("#piste").setAttribute("aria-valuetext", hhmmss(t));
+  surligner(t);
+});
+audio.addEventListener("error", avertir_lecture);
+
+function avertir_lecture() {
+  const p = $("#etat-lecture");
+  p.hidden = false;
+  p.textContent = "Ton navigateur ne lit pas ce format directement. " +
+    "Une version lisible est en cours de préparation ; la transcription, elle, " +
+    "continue normalement.";
+}
+
+$("#vitesse").addEventListener("change", (e) => {
+  audio.playbackRate = parseFloat(e.target.value);
+});
+$("#recul").addEventListener("click", () => aller_a(audio.currentTime - 10, false));
+$("#avance").addEventListener("click", () => aller_a(audio.currentTime + 10, false));
+
+/* Barre de progression : clic et glisser. */
+const piste = $("#piste");
+function position_depuis(e) {
+  const r = piste.getBoundingClientRect();
+  const x = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
+  return Math.max(0, Math.min(1, x / r.width)) * (etat.duree || audio.duration || 0);
+}
+let glisse = false;
+piste.addEventListener("pointerdown", (e) => {
+  glisse = true; piste.setPointerCapture(e.pointerId); aller_a(position_depuis(e), false);
+});
+piste.addEventListener("pointermove", (e) => { if (glisse) aller_a(position_depuis(e), false); });
+piste.addEventListener("pointerup", () => { glisse = false; });
+piste.addEventListener("keydown", (e) => {
+  const pas = e.shiftKey ? 60 : 5;
+  if (e.key === "ArrowRight") { e.preventDefault(); aller_a(audio.currentTime + pas, false); }
+  if (e.key === "ArrowLeft") { e.preventDefault(); aller_a(audio.currentTime - pas, false); }
+});
+
+/* Raccourcis clavier globaux : espace = pause, flèches = ±5 s. */
+addEventListener("keydown", (e) => {
+  if ($("#travail").hidden) return;
+  const cible = e.target;
+  if (cible.matches("input, textarea, select") ||
+      (cible === piste && e.key.startsWith("Arrow"))) return;
+  if (e.key === " ") {
+    e.preventDefault();
+    if (audio.paused) audio.play().catch(() => {}); else audio.pause();
+  } else if (e.key === "ArrowRight") {
+    e.preventDefault(); aller_a(audio.currentTime + 5, false);
+  } else if (e.key === "ArrowLeft") {
+    e.preventDefault(); aller_a(audio.currentTime - 5, false);
+  }
+});
+
+/* ------------------------------ Actions ------------------------------ */
+
+$("#copier").addEventListener("click", async () => {
+  const t = await fetch("/api/texte?ts=1").then((r) => r.text());
+  try {
+    await navigator.clipboard.writeText(t);
+    toast("Texte copié.");
+  } catch (_) {
+    const z = document.createElement("textarea");
+    z.value = t; document.body.appendChild(z); z.select();
+    document.execCommand("copy"); z.remove();
+    toast("Texte copié.");
+  }
+});
+
+const menu = $("#menu-telecharger");
+$("#telecharger").addEventListener("click", () => {
+  menu.hidden = !menu.hidden;
+  $("#telecharger").setAttribute("aria-expanded", String(!menu.hidden));
+});
+addEventListener("click", (e) => {
+  if (!e.target.closest(".menu")) { menu.hidden = true; $("#telecharger").setAttribute("aria-expanded", "false"); }
+});
+menu.querySelectorAll("button").forEach((b) => b.addEventListener("click", async () => {
+  menu.hidden = true;
+  const ts = b.dataset.ts;
+  const t = await fetch("/api/texte?ts=" + ts).then((r) => r.text());
+  const base = etat.nom.replace(/\.[^.]+$/, "") || "transcription";
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([t], { type: "text/plain;charset=utf-8" }));
+  a.download = base + (ts === "1" ? " (horodaté).txt" : ".txt");
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}));
+
+$("#arreter").addEventListener("click", () => {
+  if (!confirm("Arrêter la transcription ? Le texte déjà transcrit est gardé.")) return;
+  fetch("/api/stop", { method: "POST" });
+});
+
+$("#quitter").addEventListener("click", async () => {
+  const en_cours = ["modele", "transcription"].includes(etat.phase);
+  if (!confirm(en_cours
+      ? "Fermer le Transcripteur ? La transcription en cours s'arrête ; le "
+        + "texte déjà écrit reste dans le dossier Transcriptions."
+      : "Fermer le Transcripteur ?")) return;
+  try { await fetch("/api/quitter", { method: "POST" }); } catch (_) {}
+  if (etat.source) etat.source.close();
+  document.body.innerHTML =
+    '<main id="accueil" class="page"><header class="entete-accueil">' +
+    '<h1>Transcripteur fermé</h1><p class="sous-titre">Tu peux fermer cet ' +
+    'onglet. Pour relancer, double-clique à nouveau sur Transcripteur.exe.' +
+    '</p></header></main>';
+});
+
+$("#nouvelle").addEventListener("click", () => {
+  if (["modele", "transcription"].includes(etat.phase) &&
+      !confirm("Une transcription est en cours. L'arrêter et en démarrer une autre ?")) return;
+  fetch("/api/stop", { method: "POST" }).then(() => location.reload());
+});

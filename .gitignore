@@ -1,0 +1,10 @@
+.venv/
+build/
+dist/
+modeles/
+__pycache__/
+*.pyc
+*.spec
+tests/tmp/
+.playwright-mcp/
+*.png
