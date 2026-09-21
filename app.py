@@ -69,6 +69,7 @@ from flask import Flask, Response, jsonify, request, send_file, stream_with_cont
 
 from uness import assemblage as uness_assemblage
 from uness import cours as uness_cours
+from uness import historique as uness_historique
 from uness import recuperation as uness_recuperation
 from uness import session as uness_session
 
@@ -86,6 +87,16 @@ MODELS = {
     "small":          {"taille": "480 Mo",  "label": "\u00c9quilibr\u00e9"},
     "large-v3-turbo": {"taille": "1,6 Go",  "label": "Pr\u00e9cis"},
     "medium":         {"taille": "1,5 Go",  "label": "Tr\u00e8s pr\u00e9cis mais lent"},
+}
+
+# Depot Hugging Face de chaque modele. Recopie ici volontairement : savoir si
+# un modele est deja telecharge ne doit pas couter l'import de faster_whisper
+# (donc de CTranslate2) sur une simple requete de configuration.
+DEPOTS_MODELES = {
+    "base":           "Systran/faster-whisper-base",
+    "small":          "Systran/faster-whisper-small",
+    "medium":         "Systran/faster-whisper-medium",
+    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
 }
 
 EXTS_OK = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac", ".wma",
@@ -572,6 +583,9 @@ class Job:
         self.chapitres = []           # [{n, titre, debut, fin, ...}]
         self.titre_cours = ""
         self.sans_audio = []
+        # Cle de cache du cours charge : c'est elle qui empeche d'oublier un
+        # cours pendant qu'on travaille dessus.
+        self.cle_cours = None
 
     # -- diffusion ---------------------------------------------------------
     def emettre(self, type_, data, durable=True):
@@ -603,6 +617,44 @@ JOB = Job()
 # ---------------------------------------------------------------------------
 # Transcription
 # ---------------------------------------------------------------------------
+
+def modeles_presents():
+    """Quels modeles sont deja sur le disque, donc utilisables hors ligne et
+    sans attente.
+
+    On lit l'arborescence du cache Hugging Face a la main : passer par
+    huggingface_hub couterait un import lourd, et snapshot_download peut
+    tenter le reseau. Cette fonction ne doit ni ralentir /api/config ni lever.
+    """
+    hub = os.environ.get("HUGGINGFACE_HUB_CACHE") or os.path.join(MODELS_DIR, "hub")
+    try:
+        dossiers = os.listdir(hub)
+    except Exception:
+        dossiers = []
+    presents = {}
+    for nom in MODELS:
+        attendu = "models--" + DEPOTS_MODELES.get(nom, nom).replace("/", "--")
+        # Le depot d'un modele a deja change de proprietaire une fois : on
+        # accepte aussi tout depot dont le nom finit par 'faster-whisper-<nom>'.
+        suffixe = "faster-whisper-" + nom
+        presents[nom] = any(
+            (d == attendu or d.lower().endswith(suffixe))
+            and _snapshot_complet(os.path.join(hub, d))
+            for d in dossiers)
+    return presents
+
+
+def _snapshot_complet(dossier):
+    """Un modele a moitie telecharge a bien son dossier, mais pas son poids."""
+    instantanes = os.path.join(dossier, "snapshots")
+    try:
+        for rev in os.listdir(instantanes):
+            if os.path.isfile(os.path.join(instantanes, rev, "model.bin")):
+                return True
+    except Exception:
+        pass
+    return False
+
 
 def chemin_modele(nom, progression):
     """Retourne le dossier local du modele, en le telechargeant au besoin.
@@ -897,6 +949,7 @@ def ui(nom):
 def config():
     return jsonify({
         "modeles": MODELS,
+        "modeles_presents": modeles_presents(),
         "coeurs": os.cpu_count() or 1,
         "dossier_sortie": os.path.join(documents_dir(), "Transcriptions"),
         "etat": JOB.etat,
@@ -958,6 +1011,7 @@ def upload():
     JOB.chapitres = []
     JOB.titre_cours = ""
     JOB.sans_audio = []
+    JOB.cle_cours = None
 
     if lisible:
         JOB.chemin_lecture = cible
@@ -1166,6 +1220,7 @@ def uness_etat():
         "cookies": bool(COFFRE.lire()),
         "connexion": CONNEXION.etat,
         "message": CONNEXION.message,
+        "trace": CONNEXION.trace_vive(),
         "domaine": uness_cours.DOMAINES[0],
         "cache": DOSSIER_COURS,
     })
@@ -1279,6 +1334,7 @@ def uness_demarrer():
     JOB.transcrit = 0.0
     JOB.chapitres = []
     JOB.sans_audio = []
+    JOB.cle_cours = None
     JOB.etat = "recuperation"
     RECUP["objet"] = None
     RECUP["thread"] = threading.Thread(target=_recuperer_puis_transcrire,
@@ -1291,6 +1347,63 @@ def uness_demarrer():
 def uness_chapitres():
     return jsonify({"titre": JOB.titre_cours, "chapitres": JOB.chapitres,
                     "sans_audio": JOB.sans_audio})
+
+
+@app.get("/api/uness/historique")
+def uness_liste_historique():
+    """Les cours deja recuperes, du plus recent au plus ancien.
+
+    Lecture seule et sans surprise : un dossier de cache corrompu donne une
+    entree incomplete, jamais une erreur 500 qui viderait l'ecran d'accueil.
+    """
+    return jsonify({"cours": uness_historique.lister(
+        DOSSIER_COURS,
+        dossier_txt=os.path.join(documents_dir(), "Transcriptions"),
+        nom_fichier=nom_de_fichier_sur)})
+
+
+@app.post("/api/uness/historique/oublier")
+def uness_oublier():
+    """Supprime l'audio garde pour ce cours. Le .txt de Documents, lui,
+    appartient a l'utilisateur : on n'y touche jamais."""
+    cle = ((request.get_json(force=True, silent=True) or {}).get("cle") or "").strip()
+    if JOB.cle_cours and cle == JOB.cle_cours:
+        return jsonify({"erreur": "Ce cours est celui qui est ouvert. Charge "
+                                  "autre chose avant de l'oublier."}), 409
+    if not uness_historique.oublier(DOSSIER_COURS, cle):
+        return jsonify({"erreur": "Ce cours n'est pas dans le cache."}), 404
+    if RECUP["objet"] is not None and RECUP["objet"].cache.cle == cle:
+        RECUP["objet"] = None
+    return jsonify({"ok": True})
+
+
+@app.post("/api/uness/historique/rouvrir")
+def uness_rouvrir():
+    """Recharge un cours deja en cache comme job courant, sans une seule
+    requete reseau : de quoi le reecouter et reparcourir son plan."""
+    if JOB.etat in ("modele", "transcription", "recuperation"):
+        return jsonify({"erreur": "Une transcription est deja en cours."}), 409
+    cle = ((request.get_json(force=True, silent=True) or {}).get("cle") or "").strip()
+    fiche = uness_historique.rouvrir(DOSSIER_COURS, cle)
+    if fiche is None:
+        return jsonify({"erreur": "L'audio de ce cours n'est plus la. "
+                                  "Relance la recuperation depuis son lien."}), 404
+
+    nettoyer()
+    JOB.id += 1
+    JOB.journal = []
+    JOB.stop = threading.Event()
+    JOB.transcrit = 0.0
+    JOB.chemin = JOB.chemin_lecture = fiche["chemin"]
+    JOB.mime = "audio/mpeg"
+    JOB.duree = fiche["duree"]
+    JOB.chapitres = fiche["chapitres"]
+    JOB.titre_cours = fiche["titre"]
+    JOB.sans_audio = fiche["sans_audio"]
+    JOB.nom = fiche["titre"]
+    JOB.cle_cours = cle
+    JOB.etat = "pret"
+    return jsonify({"ok": True, "job": JOB.id})
 
 
 def _recuperer_puis_transcrire(o, job_id):
@@ -1323,6 +1436,7 @@ def _recuperer_puis_transcrire(o, job_id):
         JOB.titre_cours = r.titre
         JOB.sans_audio = r.sans_audio
         JOB.nom = r.titre
+        JOB.cle_cours = r.cache.cle
         JOB.etat = "pret"
         JOB.emettre("lecture_prete", {}, durable=False)
 

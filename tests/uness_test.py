@@ -137,6 +137,65 @@ def test_decouverte(base):
     return diapos
 
 
+def test_page_moodle(base, cache_racine):
+    """Ce que l'utilisateur colle VRAIMENT : l'adresse de sa barre d'adresse,
+    c'est-a-dire la page Moodle de la ressource, pas celle du lecteur."""
+    print("\n[3b] Page Moodle mod/resource/view.php?id=...")
+    url = SERVEUR.url_moodle
+
+    # La chaine de requete fait partie de l'adresse : la perdre donne
+    # « Identifiant de module de cours non valide ».
+    garde, base_nulle = cours.verifier_url(url)
+    verifie("la chaine ?id=... est conservee", "id=44419" in garde, garde)
+    verifie("une page Moodle n'est pas prise pour un dossier de cours",
+            base_nulle is None, base_nulle)
+
+    # Le piege : une page Moodle CONNECTEE contient des liens vers /login/.
+    # Une detection qui cherche ce motif dans le contenu prend la page de
+    # cours de l'utilisateur pour une page de connexion, et l'application
+    # attend indefiniment une session qu'elle a deja.
+    c = Client(cookies_valides(), delai=0)
+    try:
+        page = c.texte(garde)
+    except Exception as e:
+        page = None
+        verifie("une page Moodle connectee se lit malgre ses liens /login/",
+                False, "%s : %s" % (type(e).__name__, str(e)[:60]))
+    else:
+        verifie("une page Moodle connectee se lit malgre ses liens /login/",
+                page is not None and "resourcecontent" in (page or ""))
+    verifie("...et elle contient bien le piege",
+            "/login/index.php" in (page or ""))
+    if page is None:
+        return   # inutile de poursuivre : la page ne se lit meme pas
+
+    lecteur, racine = cours.resoudre_lecteur(c, garde)
+    verifie("le lecteur est trouve dans la page",
+            lecteur.endswith("index.htm"), lecteur)
+    verifie("le dossier du cours en decoule",
+            racine.endswith("/content/0/"), racine)
+
+    # Et le parcours complet doit marcher depuis cette adresse-la.
+    coffre = FauxCoffre(cookies_valides())
+    r = recuperation.Recuperation(url, coffre, cache_racine + "-moodle",
+                                  lambda t, d, durable=True: None)
+    r.client.delai = 0
+    r.decouvrir()
+    verifie("12 diapos decouvertes depuis la page Moodle",
+            len(r.diapos) == 12, len(r.diapos))
+    verifie("titres complets malgre le detour",
+            r.diapos[3]["titre"] == faux_uness.TITRES[3], r.diapos[3]["titre"])
+    shutil.rmtree(cache_racine + "-moodle", ignore_errors=True)
+
+    # Une page sans lecteur doit le dire clairement.
+    try:
+        cours.resoudre_lecteur(c, base + "data/presentation.xml")
+        verifie("une page sans lecteur est signalee", False, "accepte a tort")
+    except cours.ErreurCours as e:
+        verifie("une page sans lecteur est signalee",
+                "lecteur" in str(e).lower(), str(e)[:60])
+
+
 def test_sondage():
     print("\n[4] Repli : sondage des numeros quand le manifeste manque")
     srv, base = faux_uness.demarrer(nb_diapos=9, sans_audio=(3,))
@@ -506,6 +565,7 @@ def main():
         test_url()
         test_session_absente(base)
         test_decouverte(base)
+        test_page_moodle(base, cache_racine)
         test_sondage()
         r = test_telechargement_et_cache(base, cache_racine)
         test_reprise(base, cache_racine)

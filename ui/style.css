@@ -151,6 +151,8 @@ input[type="url"], input[type="text"] {
 .session-etat { display: flex; gap: .5rem; align-items: center; margin: 0 0 .6rem; font-size: .9375rem; }
 .session-actions { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
 .session .aide { margin-top: .6rem; }
+.session .repli { margin-top: .9rem; }
+#session-detail { margin-top: -.3rem; margin-bottom: .6rem; }
 .pastille {
   flex: none; width: 9px; height: 9px; border-radius: 50%;
   background: var(--trait); box-shadow: 0 0 0 2px var(--surface);
@@ -160,9 +162,43 @@ input[type="url"], input[type="text"] {
 @media (prefers-color-scheme: dark) { .pastille.ok { background: #64c07e; } }
 .session-actions .lien-bouton { margin-left: 0; }
 
+/* ---- Historique des cours ---- */
+.historique { margin-top: 1.5rem; }
+.historique-titre {
+  font-size: .8125rem; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--gris); margin: 0 0 .5rem; font-weight: 600;
+}
+.historique-liste { list-style: none; margin: 0; padding: 0; display: grid; gap: .5rem; }
+.historique-item {
+  display: grid; gap: .15rem;
+  border: 1px solid var(--trait); border-radius: var(--rayon);
+  background: var(--surface); padding: .7rem .9rem;
+}
+.historique-nom { font-weight: 600; word-break: break-word; }
+.historique-actions {
+  display: flex; gap: .75rem; align-items: center; margin-top: .45rem;
+}
+.historique-actions .lien-bouton { margin-left: auto; }
+.historique .aide { margin-top: .6rem; }
+
+/* Un avertissement n'est pas une alerte : il informe avant un clic, il ne
+   signale pas un problème. D'où le gris, pas le rouge. */
+.avertissement { margin-top: .6rem; }
+.avertissement.attention {
+  color: var(--encre);
+  border-left: 3px solid var(--accent);
+  padding-left: .6rem;
+}
+
 .repli { margin-top: 1.25rem; font-size: .9375rem; }
 .repli summary { cursor: pointer; color: var(--accent); }
 .repli > :not(summary) { margin-top: .7rem; }
+.trace pre {
+  font-family: var(--mono); font-size: .75rem; line-height: 1.5;
+  background: var(--surface); border: 1px solid var(--trait);
+  border-radius: var(--rayon); padding: .6rem .7rem;
+  overflow-x: auto; white-space: pre; margin: 0;
+}
 .guide { padding-left: 1.2rem; }
 .guide li { margin-bottom: .3rem; }
 kbd {

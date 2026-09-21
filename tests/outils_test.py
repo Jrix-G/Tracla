@@ -70,12 +70,55 @@ def bip(chemin_wav, secondes=6.0):
     return True
 
 
+# Parole francaise embarquee dans le depot : synthese vocale Windows sur notre
+# propre texte (TEXTE_FR), donc aucun contenu tiers a licencier.
+#
+# Pourquoi elle existe : sur une machine sans voix de synthese, le repli
+# etait un simple 'bip'. Whisper y hallucinait "Sous-titres realises par
+# Amara.org", le filtre anti-hallucination -- alors casse -- le laissait
+# passer, et "au moins un segment recu" passait PAR ACCIDENT. Une fois le
+# filtre repare, ce test aurait echoue sur toute machine sans voix, et
+# bloque la publication pour une raison qui n'a rien a voir avec le code.
+ECHANTILLON_FR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "echantillons", "parole_fr.mp3")
+
+
+def parole_embarquee(chemin_wav):
+    """Decode l'echantillon du depot vers 'chemin_wav'. True si ca a marche."""
+    if not os.path.isfile(ECHANTILLON_FR):
+        return False
+    try:
+        import av
+        with av.open(ECHANTILLON_FR) as e, \
+                av.open(chemin_wav, "w", format="wav") as s:
+            fi = next(x for x in e.streams if x.type == "audio")
+            fo = s.add_stream("pcm_s16le", rate=16000)
+            r = av.AudioResampler(format="s16", layout="mono", rate=16000)
+            for t in e.decode(fi):
+                for o in r.resample(t):
+                    for p in fo.encode(o):
+                        s.mux(p)
+            for p in fo.encode(None):
+                s.mux(p)
+        return os.path.getsize(chemin_wav) > 10000
+    except Exception:
+        return False
+
+
 def audio_de_test(chemin_wav, texte=TEXTE_FR):
-    """Fabrique un wav de test. Renvoie 'sapi', 'espeak' ou 'bip'."""
+    """Fabrique un wav de test.
+
+    Renvoie 'sapi', 'espeak', 'embarque' ou 'bip'. Seul 'bip' ne contient
+    aucun mot : un test qui attend du texte transcrit ne doit pas s'y fier.
+    L'echantillon embarque ne vaut que pour TEXTE_FR : un autre texte ne
+    peut pas s'en servir.
+    """
     if parole_sapi(chemin_wav, texte):
         return "sapi"
     if parole_espeak(chemin_wav, texte):
         return "espeak"
+    if texte == TEXTE_FR and parole_embarquee(chemin_wav):
+        return "embarque"
     bip(chemin_wav)
     return "bip"
 

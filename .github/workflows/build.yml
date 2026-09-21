@@ -12,7 +12,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -80,16 +80,24 @@ jobs:
             --exclude-module scipy `
             app.py
 
-      # Les modules UNESS ne dependent ni de Whisper ni de l'exe : on les teste
-      # tot, contre le faux Moodle, pour ne pas decouvrir une regression apres
-      # 20 minutes de build.
+      # Ces suites ne demandent ni navigateur ni exe : elles tournent tot et
+      # vite. Les deux suites qui ouvrent une vraie fenetre Edge
+      # (uness_fenetre_exe, uness_trace_test) restent volontairement hors CI :
+      # elles exigent une session graphique et bloqueraient une publication
+      # pour une raison qui n'a rien a voir avec le code.
       - name: Tester l'import UNESS (faux serveur)
         shell: pwsh
         env:
           PYTHONIOENCODING: utf-8
         run: |
-          python tests/uness_test.py
-          if ($LASTEXITCODE) { throw "Les tests UNESS ont echoue" }
+          foreach ($suite in @("tests/uness_test.py",
+                               "tests/uness_ordre_test.py",
+                               "tests/uness_historique_test.py",
+                               "tests/uness_parcours.py")) {
+            "== $suite"
+            python $suite
+            if ($LASTEXITCODE) { throw "$suite a echoue" }
+          }
 
       - name: Test de fumée (démarrage, upload, Range, arrêt)
         run: python tests/smoke_exe.py

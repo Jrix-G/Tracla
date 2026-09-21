@@ -41,16 +41,27 @@ un fichier audio, mais **un mp3 par diapo**. Le Transcripteur les récupère
 tous, les assemble en un seul fichier, et transcrit le tout d'une traite en
 gardant la structure du cours.
 
-1. Ouvre ton cours dans ton navigateur habituel et copie l'adresse de la page
-   du lecteur (elle finit en général par `index.htm`).
+1. Ouvre ton cours dans UNESS et **copie l'adresse affichée dans la barre de
+   ton navigateur**. C'est tout : pas besoin d'aller chercher une autre
+   adresse. Les deux formes marchent, `…/mod/resource/view.php?id=44419`
+   comme `…/pluginfile.php/…/index.htm`.
 2. Colle-la dans le champ **Lien du cours**.
 3. Clique **Se connecter à UNESS**. Une fenêtre de navigateur s'ouvre sur ton
    cours : connecte-toi comme d'habitude, SSO et double authentification
    comprises. Dès que la connexion est valide, la fenêtre se referme toute
-   seule et la pastille passe au vert.
+   seule et la pastille passe au vert. Si tu étais déjà connecté la dernière
+   fois, la pastille passe au vert dès que tu colles le lien, sans rien
+   cliquer.
 4. Clique **Récupérer et transcrire**. Tu vois d'abord « Récupération de
-   l'audio : diapo 23/79 », puis la transcription en direct. **Tu peux écouter
-   dès que l'audio est prêt**, sans attendre la fin du texte.
+   l'audio : diapo 23/37 · encore 40 s », puis la transcription en direct.
+   **Tu peux écouter dès que l'audio est prêt**, sans attendre la fin du texte.
+
+**Tes cours restent sur ton disque.** Sous le champ du lien, la liste
+« Cours déjà récupérés » montre ce que tu as importé : durée, nombre de diapos,
+place occupée, et si le cours est déjà transcrit. **Rouvrir** te rend le
+lecteur et le plan en une seconde, sans connexion et sans retélécharger.
+**Supprimer** libère la place ; la transcription enregistrée dans Documents
+n'est jamais touchée.
 
 Le texte obtenu est structuré par diapo :
 
@@ -590,3 +601,9 @@ Les fichiers téléchargés par les tests proviennent de Wikimedia Commons
 (« Fr-Spoken Wikipedia-Marie Curie », CC BY-SA 3.0 ; « Magali Balent de l'IRIS
 au micro de Jacques Aristide », domaine public). Ils ne sont pas redistribués
 dans ce dépôt.
+
+`tests/echantillons/parole_fr.mp3` (90 Ko) est, lui, embarqué : c'est la
+synthèse vocale de Windows lisant notre propre texte de test, sans aucun
+contenu tiers. Il sert de repli sur une machine sans voix de synthèse — la CI
+notamment — pour que les tests vérifient une vraie transcription plutôt qu'un
+signal pur dont Whisper, à juste titre, ne tire rien.

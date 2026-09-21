@@ -44,6 +44,12 @@ MOTIF_RE = re.compile(r"^(.*?)(\d+)(\.mp3)$", re.IGNORECASE)
 
 MAX_DIAPOS = 2000  # garde-fou : on ne sonde jamais indefiniment
 
+# Les cles sous lesquelles un lecteur range le titre d'une diapo. On ne
+# connait pas la liste des lecteurs : on cherche donc les memes cles dans le
+# XML, dans le JSON et dans le JavaScript, au lieu d'un format en dur.
+CLES_TITRE = ("title", "label", "name", "displayname", "navtitle",
+              "slidetitle", "heading", "caption")
+
 
 class ErreurCours(Exception):
     """Erreur montrable telle quelle a l'utilisateur."""
@@ -54,10 +60,17 @@ class ErreurCours(Exception):
 # ---------------------------------------------------------------------------
 
 def verifier_url(url):
-    """Valide l'URL saisie et renvoie (url_index, base) ou leve ErreurCours.
+    """Valide l'URL saisie et renvoie (url, base) ou leve ErreurCours.
 
     'base' est le dossier du cours, termine par '/' : c'est la racine a
     laquelle 'data/xxx.mp3' est relatif.
+
+    'base' vaut **None** quand l'URL est une page Moodle (par exemple
+    .../mod/resource/view.php?id=44419) : c'est la page qui CONTIENT le
+    lecteur, pas le lecteur. C'est pourtant celle que l'utilisateur a sous les
+    yeux dans sa barre d'adresse, donc celle qu'il colle. Il faut la lire,
+    connecte, pour trouver l'adresse reelle du lecteur : voir
+    resoudre_lecteur().
     """
     url = (url or "").strip()
     if not url:
@@ -76,19 +89,63 @@ def verifier_url(url):
             "%s sont acceptes, et celui-ci pointe vers %s."
             % (DOMAINES[0], hote or "un site inconnu"))
     chemin = p.path or "/"
+    # La chaine de requete fait partie de l'adresse : sans le '?id=44419',
+    # mod/resource/view.php repond "Identifiant de module de cours non valide".
+    requete = ("?" + p.query) if p.query else ""
+    racine = "%s://%s" % (p.scheme.lower(), p.netloc)
+    dernier = chemin.rsplit("/", 1)[-1]
+
+    if dernier.endswith(".php"):
+        return racine + chemin + requete, None
+
     # On accepte l'URL du dossier comme celle d'un fichier de la page.
     if chemin.endswith("/"):
         base_chemin, index = chemin, chemin + "index.htm"
+    elif "." in dernier:
+        base_chemin = chemin.rsplit("/", 1)[0] + "/"
+        index = chemin
     else:
-        dernier = chemin.rsplit("/", 1)[-1]
-        if "." in dernier:
-            base_chemin = chemin.rsplit("/", 1)[0] + "/"
-            index = chemin
-        else:
-            base_chemin = chemin + "/"
-            index = base_chemin + "index.htm"
-    racine = "%s://%s" % (p.scheme.lower(), p.netloc)
-    return racine + index, racine + base_chemin
+        base_chemin = chemin + "/"
+        index = base_chemin + "index.htm"
+    return racine + index + requete, racine + base_chemin
+
+
+# Le lecteur, tel que Moodle l'insere dans sa page : un iframe, un object, un
+# lien "ouvrir dans une nouvelle fenetre", ou une redirection directe.
+LECTEUR_RE = re.compile(
+    r"""["'(]([^"'()\s]*pluginfile\.php/[^"'()\s]*?\.html?)(?:\?[^"'()\s]*)?["')]""",
+    re.IGNORECASE)
+
+
+def resoudre_lecteur(client, url):
+    """Depuis une page Moodle, trouve l'adresse du lecteur. -> (url, base)
+
+    L'utilisateur colle ce que son navigateur affiche :
+    .../mod/resource/view.php?id=44419. Ce n'est pas le lecteur, c'est la page
+    qui l'affiche -- dans un cadre, ou derriere une redirection. On la lit
+    (connecte) et on en extrait l'adresse reelle.
+    """
+    html = client.texte(url)
+    if html is None:
+        raise ErreurCours(
+            "Impossible de lire cette page du cours. Verifie le lien, et que "
+            "tu es bien connecte a UNESS.")
+
+    # Moodle redirige parfois directement vers le fichier : dans ce cas
+    # l'adresse finale est deja la bonne.
+    finale = getattr(client, "derniere_url", None) or url
+    if "pluginfile.php/" in finale and re.search(r"\.html?($|\?)", finale, re.I):
+        propre = finale.split("?")[0]
+        return propre, propre.rsplit("/", 1)[0] + "/"
+
+    for m in LECTEUR_RE.finditer(html):
+        lien = urljoin(finale, _desechapper(m.group(1))).split("?")[0]
+        return lien, lien.rsplit("/", 1)[0] + "/"
+
+    raise ErreurCours(
+        "Cette page ne contient pas de lecteur de cours. Ouvre ton cours dans "
+        "ton navigateur, va sur la page du lecteur (celle avec les diapos et "
+        "le bouton de lecture), et copie SON adresse.")
 
 
 def identifiant(base):
@@ -170,15 +227,14 @@ def _diapos_depuis_xml(texte):
                           for e in el.iter()]])
         mp3 = MP3_RE.search(blob)
         titre = ""
-        for cle in ("title", "label", "name", "displayname", "text", "navtitle"):
+        for cle in CLES_TITRE + ("text",):
             if attrs.get(cle):
                 titre = _propre(_desechapper(attrs[cle]))
                 if titre:
                     break
         if not titre:
             for enfant in el:
-                if enfant.tag.rsplit("}", 1)[-1].lower() in (
-                        "title", "label", "name", "text"):
+                if enfant.tag.rsplit("}", 1)[-1].lower() in CLES_TITRE + ("text",):
                     titre = _propre(_desechapper(enfant.text or ""))
                     if titre:
                         break
@@ -193,6 +249,8 @@ def _diapos_depuis_js(texte):
     On tente le JSON d'abord, puis on se rabat sur un appariement local
     titre <-> mp3 dans l'ordre du fichier."""
     diapos = []
+    # La cle peut etre citee ("title": "...") comme nue (title: '...').
+    cles = "|".join(CLES_TITRE)
 
     # 1) Un JSON complet quelque part dans le fichier. On ne tente que les
     #    quelques premieres accolades : au-dela on est dans du code, pas dans
@@ -213,13 +271,71 @@ def _diapos_depuis_js(texte):
     #    situe avant lui.
     titres = [(m.start(), _propre(_desechapper(m.group(1))))
               for m in re.finditer(
-                  r"""(?:title|label|name|navTitle)\s*[:=]\s*["']([^"']{2,200})["']""",
+                  r"""(?:%s)["']?\s*[:=]\s*["']([^"']{2,200})["']""" % cles,
                   texte, re.IGNORECASE)]
-    for m in MP3_RE.finditer(texte):
-        avant = [t for pos, t in titres if pos < m.start() and t]
-        diapos.append({"titre": avant[-1] if avant else "",
-                       "fichier": m.group(0)})
+    mp3 = list(MP3_RE.finditer(texte))
+
+    # Deux listes paralleles que le JSON n'a pas su lire : tous les titres
+    # d'abord, tous les fichiers ensuite. Prendre "le titre juste avant"
+    # collerait alors le dernier titre a chacun des mp3.
+    if mp3 and len(titres) == len(mp3) and all(t for _, t in titres) \
+            and titres[-1][0] < mp3[0].start():
+        return [{"titre": t, "fichier": m.group(0)}
+                for (_, t), m in zip(titres, mp3)]
+
+    # Un titre ne sert qu'une fois : un fichier de donnees qui n'annonce que
+    # le titre du cours le collerait sinon a chacune de ses diapos, ce qui
+    # revient a inventer 37 titres a partir d'un seul.
+    dernier = 0
+    for m in mp3:
+        avant = [i for i, (pos, t) in enumerate(titres)
+                 if i >= dernier and pos < m.start() and t]
+        titre = ""
+        if avant:
+            titre = titres[avant[-1]][1]
+            dernier = avant[-1] + 1
+        diapos.append({"titre": titre, "fichier": m.group(0)})
     return diapos
+
+
+def _diapos_paralleles(bas):
+    """Un objet qui range les titres et les fichiers dans DEUX listes de meme
+    longueur, au lieu d'un objet par diapo. C'est la forme du lecteur du cours
+    116724, et le rang est alors la seule chose qui relie un titre a son
+    audio : une entree vide reste donc une diapo, sans audio."""
+    fichiers = None
+    for v in bas.values():
+        if isinstance(v, list) and len(v) >= 2 and any(
+                isinstance(x, str) and x.lower().endswith(".mp3") for x in v):
+            fichiers = v
+            break
+    if fichiers is None:
+        return []
+
+    titres = None
+    for cle, v in bas.items():
+        if v is fichiers or not isinstance(v, list) or len(v) != len(fichiers):
+            continue
+        if not all(isinstance(x, str) for x in v):
+            continue
+        if any(x.lower().endswith(".mp3") for x in v):
+            continue
+        if any(c in cle for c in CLES_TITRE):
+            titres = v
+            break
+        # A cle inconnue, c'est la forme qui tranche : un titre de diapo porte
+        # des espaces, un identifiant ('s1', 'slide_02') non. Sans ce
+        # garde-fou on fabriquerait des titres a partir d'une liste d'ids.
+        if titres is None and sum(1 for x in v if " " in x.strip()) > len(v) / 2:
+            titres = v
+
+    sortie = []
+    for i, f in enumerate(fichiers):
+        f = f.rsplit("/", 1)[-1] if isinstance(f, str) else ""
+        sortie.append({
+            "titre": _propre(_desechapper(titres[i])) if titres else "",
+            "fichier": f if f.lower().endswith(".mp3") else None})
+    return sortie
 
 
 def _diapos_depuis_json(donnees):
@@ -229,13 +345,19 @@ def _diapos_depuis_json(donnees):
     def visiter(noeud):
         if isinstance(noeud, dict):
             bas = {str(k).lower(): v for k, v in noeud.items()}
+            paralleles = _diapos_paralleles(bas)
+            if paralleles:
+                # Les listes sont deja le plan complet : descendre dedans ne
+                # ferait que reproduire les memes fichiers sans leur titre.
+                trouve.extend(paralleles)
+                return
             mp3 = None
             for v in bas.values():
                 if isinstance(v, str) and v.lower().endswith(".mp3"):
                     mp3 = v.rsplit("/", 1)[-1]
                     break
             titre = ""
-            for cle in ("title", "label", "name", "displayname", "navtitle"):
+            for cle in CLES_TITRE:
                 v = bas.get(cle)
                 if isinstance(v, str) and v.strip():
                     titre = _propre(_desechapper(v))
@@ -281,9 +403,20 @@ def _ranger(diapos):
     return propres
 
 
-def _numero_de(fichier):
-    m = MOTIF_RE.match(fichier or "")
-    return int(m.group(2)) if m else None
+def _numeroter(diapos):
+    """Numerote un plan LU dans un document : l'ordre du document fait foi.
+
+    Constate sur le cours 116724 : ses mp3 s'appellent a24x1..a24x37, mais le
+    lecteur les liste dans l'ordre 3, 7, 4, 6... Ces nombres sont des
+    identifiants d'asset, pas des numeros de diapo. Trier ou renumeroter
+    d'apres eux remontait un cours entier dans le desordre, sans un mot.
+
+    Le sondage est l'autre origine possible d'un plan, et la seule ou le
+    nombre present dans le nom signifie quelque chose : c'est lui qui fabrique
+    la sequence. Il numerote donc lui-meme, voir sonder().
+    """
+    return [{"n": i + 1, "titre": d.get("titre") or "", "fichier": d["fichier"]}
+            for i, d in enumerate(diapos)]
 
 
 def decouvrir(client, url_index, base, journal=None):
@@ -307,8 +440,12 @@ def decouvrir(client, url_index, base, journal=None):
 
     # -- 1. Les manifestes connus, plus les scripts reellement charges -------
     candidats = list(MANIFESTES)
-    for m in re.finditer(r"""(?:src|href)\s*=\s*["']([^"']+\.(?:js|xml|txt))["']""",
-                         html, re.IGNORECASE):
+    # Suivre ce que la page charge vraiment est la seule facon de lire un
+    # lecteur qu'on n'a jamais vu : celui du cours 116724 n'a aucun manifeste
+    # connu, juste un fichier au nom qui lui est propre.
+    for m in re.finditer(
+            r"""(?:src|href|data)\s*=\s*["']([^"']+\.(?:js|xml|json|txt))["']""",
+            html, re.IGNORECASE):
         chemin = m.group(1)
         if not chemin.startswith(("http://", "https://", "//")):
             candidats.append(chemin)
@@ -416,24 +553,6 @@ def sonder(client, base, graine, total, dire=lambda *a: None):
     dire("Sondage termine : %d diapos, dont %d avec audio."
          % (len(diapos), sum(1 for d in diapos if d["fichier"])))
     return diapos
-
-
-def _numeroter(diapos):
-    """Le numero de diapo vient du nom de fichier quand il s'y trouve
-    (a24x7.mp3 -> diapo 7) : c'est lui qui fait foi, pas l'ordre de lecture
-    du manifeste. On complete les trous pour que le plan reste continu."""
-    numeros = [_numero_de(d["fichier"]) for d in diapos]
-    if all(n is not None for n in numeros) and len(set(numeros)) == len(numeros):
-        par_numero = {n: d for n, d in zip(numeros, diapos)}
-        sortie = []
-        for n in range(1, max(numeros) + 1):
-            d = par_numero.get(n)
-            sortie.append({"n": n,
-                           "titre": d["titre"] if d else "",
-                           "fichier": d["fichier"] if d else None})
-        return sortie
-    return [{"n": i + 1, "titre": d["titre"], "fichier": d["fichier"]}
-            for i, d in enumerate(diapos)]
 
 
 def vocabulaire(titre_cours, diapos, limite=850):

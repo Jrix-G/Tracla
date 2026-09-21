@@ -8,6 +8,7 @@ app.py de diffuser la progression sur le flux SSE existant.
 
 import os
 import threading
+import time
 from urllib.parse import urljoin
 
 from . import assemblage, cours, telechargement
@@ -22,9 +23,14 @@ class Recuperation:
     """Un cours en cours de recuperation. Un seul a la fois, comme le job."""
 
     def __init__(self, url, coffre, racine_cache, evenement, stop=None):
-        self.url_index, self.base = cours.verifier_url(url)
+        # 'base' vaut None quand l'utilisateur a colle une page Moodle
+        # (mod/resource/view.php?id=...) : on ne connait le dossier du cours
+        # qu'apres l'avoir lue, connecte.
+        self.url_demandee, self.base = cours.verifier_url(url)
+        self.url_index = self.url_demandee
         self.coffre = coffre
-        self.cache = telechargement.Cache(racine_cache, cours.identifiant(self.base))
+        self.racine_cache = racine_cache
+        self._cache = None
         self.evenement = evenement          # evenement(type, data)
         self.stop = stop or threading.Event()
         self.client = Client(coffre.lire())
@@ -35,8 +41,36 @@ class Recuperation:
         # Mis a True quand la session a laches en cours de route : le serveur
         # demande alors une reconnexion, puis rappelle reprendre().
         self.attend_connexion = False
+        # Debit reellement observe. Annoncer un temps restant a partir d'une
+        # constante serait faux d'un facteur dix entre une fibre et un partage
+        # de connexion : on ne mesure que ce qu'on a vu passer.
+        self.octets = 0          # octets recus depuis le debut du cours
+        self._faits = 0          # diapos reellement telechargees
+        self._temps = 0.0        # temps passe a les telecharger
 
     # -- utilitaires --------------------------------------------------------
+
+    @property
+    def cache(self):
+        """Le dossier de cache depend du dossier du cours, qu'on ne connait
+        parfois qu'apres resolution : on le construit donc a la demande."""
+        if self._cache is None:
+            cle = cours.identifiant(self.base or self.url_demandee)
+            self._cache = telechargement.Cache(self.racine_cache, cle)
+        return self._cache
+
+    def resoudre(self):
+        """Transforme une page Moodle en adresse de lecteur. Sans effet si
+        l'utilisateur a deja colle l'adresse du lecteur."""
+        if self.base is not None:
+            return
+        self.evenement("uness", {
+            "etape": "analyse",
+            "message": "Recherche du lecteur dans la page du cours..."})
+        self.url_index, self.base = cours.resoudre_lecteur(
+            self.client, self.url_demandee)
+        self._cache = None          # la cle de cache depend du dossier trouve
+        self._dire("Lecteur trouve : %s" % self.url_index.rsplit("/", 2)[-2:][0])
 
     def _dire(self, message):
         self.evenement("uness", {"etape": "info", "message": message})
@@ -54,13 +88,14 @@ class Recuperation:
         cours, et la fenetre de connexion se debrouille pour en extraire un
         mp3 une fois l'utilisateur identifie.
         """
-        for d in self.diapos:
-            if d.get("fichier"):
-                return urljoin(self.base, "data/" + d["fichier"])
-        plan = self.cache.lire_chapitres() or {}
-        for d in plan.get("diapos", []):
-            if d.get("fichier"):
-                return urljoin(self.base, "data/" + d["fichier"])
+        if self.base:
+            for d in self.diapos:
+                if d.get("fichier"):
+                    return urljoin(self.base, "data/" + d["fichier"])
+            plan = self.cache.lire_chapitres() or {}
+            for d in plan.get("diapos", []):
+                if d.get("fichier"):
+                    return urljoin(self.base, "data/" + d["fichier"])
         return self.url_index
 
     def rafraichir_cookies(self):
@@ -68,6 +103,13 @@ class Recuperation:
         self.attend_connexion = False
 
     def session_valide(self):
+        if self.base is None:
+            # Page Moodle pas encore resolue : la lire suffit a savoir si la
+            # session tient (une page de connexion leve SessionExpiree).
+            try:
+                return bool(self.client.texte(self.url_demandee))
+            except SessionExpiree:
+                return False
         cible = self.url_de_test()
         if cible == self.url_index:
             # Pas encore de mp3 connu : on se contente de verifier que la page
@@ -83,6 +125,7 @@ class Recuperation:
 
     def decouvrir(self):
         self._verifier_arret()
+        self.resoudre()
         self.evenement("uness", {"etape": "analyse",
                                  "message": "Lecture de la page du cours..."})
         titre, diapos, methode = cours.decouvrir(
@@ -124,8 +167,13 @@ class Recuperation:
                 self._progres(i + 1, total, numero, cache=True)
                 continue
             url = urljoin(self.base, "data/" + d["fichier"])
+            depart = time.monotonic()
             try:
-                self.client.telecharger(url, self.cache.fichier(d["fichier"]))
+                taille = self.client.telecharger(url,
+                                                 self.cache.fichier(d["fichier"]))
+                self.octets += taille or 0
+                self._faits += 1
+                self._temps += time.monotonic() - depart
             except SessionExpiree:
                 self.attend_connexion = True
                 self.evenement("uness", {
@@ -149,9 +197,32 @@ class Recuperation:
     def _progres(self, fait, total, numero, cache=False):
         self.evenement("uness", {
             "etape": "audio", "fait": fait, "total": total, "diapo": numero,
-            "cache": cache,
+            "cache": cache, "octets": self.octets,
+            "reste_s": self._reste_estime(fait),
             "message": "Recuperation de l'audio : diapo %d/%d" % (fait, total)},
             durable=False)
+
+    def _reste_estime(self, index):
+        """Secondes restantes d'apres le debit observe, ou None.
+
+        On renvoie None tant que la mesure ne veut rien dire : moins de trois
+        diapos reellement telechargees (une reprise qui ne fait que relire le
+        cache irait a l'infini et donnerait un temps absurde). Ne comptent
+        ensuite que les diapos qui restent VRAIMENT a telecharger -- une diapo
+        deja en cache ou sans audio ne coute rien, l'inclure gonflerait
+        l'estimation de la moitie sur une reprise.
+        """
+        if self._faits < 3 or self._temps <= 0:
+            return None
+        par_diapo = self._temps / self._faits
+        restant = 0
+        for d in self.diapos[index:]:
+            nom = d.get("fichier")
+            # os.path.isfile et pas cache.valide() : on ne decode pas tout le
+            # cours pour afficher un compte a rebours.
+            if nom and not os.path.isfile(self.cache.fichier(nom)):
+                restant += 1
+        return int(round(restant * par_diapo))
 
     def assembler(self):
         self._verifier_arret()

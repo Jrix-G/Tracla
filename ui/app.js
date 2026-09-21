@@ -72,7 +72,9 @@ fetch("/api/config").then((r) => r.json()).then((c) => {
   etat.coeurs = c.coeurs || 4;
   $("#dossier-sortie").textContent = c.dossier_sortie;
   if (c.uness_domaine) $("#uness-domaine").textContent = c.uness_domaine;
+  etat.modeles_presents = c.modeles_presents || {};
   construire_qualites();
+  maj_avertissement_modele();
   if (["recuperation", "modele", "transcription", "fini", "arrete", "erreur"]
       .includes(c.etat)) {
     // Reprise après un rechargement de page : on retrouve le travail en cours.
@@ -107,6 +109,34 @@ function construire_qualites() {
       </span>`;
     boite.appendChild(l);
   }
+  boite.addEventListener("change", maj_avertissement_modele);
+}
+
+/* Le téléchargement du modèle est le seul moment où l'application peut
+   sembler bloquée plusieurs minutes. On le dit AVANT le clic, pas pendant. */
+function maj_avertissement_modele() {
+  const choisi = document.querySelector('input[name="modele"]:checked');
+  const p = $("#avertissement-modele");
+  const presents = etat.modeles_presents;
+  // Sans l'information, on se tait : annoncer un téléchargement de 480 Mo
+  // à tort serait pire que de ne rien dire.
+  if (!choisi || !presents || !Object.keys(presents).length) {
+    p.hidden = true;
+    return;
+  }
+  const nom = choisi.value;
+  if (presents[nom]) {
+    p.textContent = "Ce modèle est déjà sur ton ordinateur : rien à télécharger.";
+    p.classList.remove("attention");
+    p.hidden = false;
+    return;
+  }
+  const m = etat.modeles[nom] || {};
+  p.textContent = `Ce modèle n'est pas encore téléchargé : ${m.taille || "?"} ` +
+    "à récupérer une seule fois, avant que la transcription ne démarre. " +
+    "Ensuite l'application fonctionne hors ligne.";
+  p.classList.add("attention");
+  p.hidden = false;
 }
 
 /* ------------------------------ Dépôt ------------------------------ */
@@ -203,16 +233,196 @@ function maj_bouton_lancer() {
     : !($("#uness-url").value.trim() && etat.uness.connecte);
 }
 
-$("#uness-url").addEventListener("input", maj_bouton_lancer);
+/* Coller-et-partir : dès que l'adresse ressemble à un lien UNESS, on vérifie
+   la session sans rien demander. L'utilisateur ne clique « Se connecter » que
+   si c'est réellement nécessaire. */
+let verif_differee;
+$("#uness-url").addEventListener("input", () => {
+  maj_bouton_lancer();
+  clearTimeout(verif_differee);
+  const url = $("#uness-url").value.trim();
+  if (!url || !/formation\.uness\.fr/i.test(url)) return;
+  verif_differee = setTimeout(() => {
+    if (etat.uness.cookies) verifier_session();
+  }, 600);
+});
 
-function afficher_session(connecte, texte) {
+$("#uness-url").addEventListener("paste", () => {
+  // Le champ n'est pas encore à jour au moment du collage.
+  setTimeout(() => $("#uness-url").dispatchEvent(new Event("input")), 0);
+});
+
+function afficher_session(connecte, texte, detail) {
   etat.uness.connecte = connecte;
   $("#session-pastille").className = "pastille " + (connecte ? "ok" : "ko");
   $("#session-texte").textContent = texte;
+  const d = $("#session-detail");
+  d.textContent = detail || "";
+  d.hidden = !detail;
   $("#uness-deconnexion").hidden = !connecte && !etat.uness.cookies;
   $("#uness-connexion").textContent = connecte
     ? "Se reconnecter" : "Se connecter à UNESS";
+  // Une fois connecté, le mode d'emploi de la connexion n'a plus d'utilité.
+  $("#session-aide").hidden = connecte;
   maj_bouton_lancer();
+}
+
+/* Traduit une ligne de trace technique en une phrase utile.
+   La trace reste disponible sous « Détails » : elle sert au diagnostic, pas
+   à informer l'utilisateur de ce qui se passe. */
+function phrase_depuis_trace(lignes) {
+  if (!lignes || !lignes.length) return "";
+  const t = lignes.join("\n");
+  if (/PAGE DE CONNEXION|formulaire de connexion/.test(t))
+    return "J'attends que tu sois identifié dans la fenêtre.";
+  if (/lecteur trouve|la page reference/.test(t))
+    return "J'ai trouvé ton cours, je cherche son audio…";
+  if (/via l'onglet/.test(t))
+    return "Je lis ton cours…";
+  if (/onglet affiche/.test(t))
+    return "La fenêtre est ouverte sur ton cours.";
+  return "";
+}
+
+/* Ce que la fenêtre a réellement reçu. N'apparaît qu'en cas d'échec : c'est
+   la seule chose qui permette de diagnostiquer un site qu'on ne peut pas
+   reproduire. Les adresses sont affichées sans leur chaîne de requête, qui
+   transporte des tickets d'authentification. */
+function afficher_trace(lignes) {
+  const boite = $("#uness-trace");
+  if (!lignes || !lignes.length) { boite.hidden = true; return; }
+  boite.querySelector("pre").textContent = lignes.join("\n");
+  boite.hidden = false;
+}
+
+/* ---------------------------- Historique ----------------------------
+   On transcrit rarement un seul cours. Recoller une adresse à chaque fois,
+   et perdre une transcription terminée au redémarrage, sont deux frictions
+   évitables. */
+
+function charger_historique() {
+  fetch("/api/uness/historique").then((r) => r.json()).then((h) => {
+    const liste = $("#historique-liste");
+    liste.innerHTML = "";
+    const cours = h.cours || [];
+    if (!cours.length) { $("#historique").hidden = true; return; }
+    for (const c of cours) liste.appendChild(ligne_historique(c));
+    $("#historique").hidden = false;
+  }).catch(() => { $("#historique").hidden = true; });
+}
+
+function ligne_historique(c) {
+  const li = document.createElement("li");
+  li.className = "historique-item";
+
+  const titre = document.createElement("b");
+  titre.className = "historique-nom";
+  titre.textContent = c.titre || "Cours sans titre";
+
+  const meta = document.createElement("span");
+  meta.className = "meta";
+  const bouts = [];
+  if (c.duree) bouts.push(duree_humaine(c.duree));
+  if (c.diapos) bouts.push(`${c.diapos} diapos`);
+  if (c.taille_mo) bouts.push(`${c.taille_mo.toFixed(0)} Mo`);
+  if (c.date) bouts.push(date_humaine(c.date));
+  meta.textContent = bouts.join(" · ");
+
+  const actions = document.createElement("div");
+  actions.className = "historique-actions";
+
+  if (c.audio_pret) {
+    const rouvrir = document.createElement("button");
+    rouvrir.type = "button";
+    rouvrir.className = "secondaire";
+    rouvrir.textContent = "Rouvrir";
+    rouvrir.addEventListener("click", () => rouvrir_cours(c, rouvrir));
+    actions.appendChild(rouvrir);
+  } else {
+    const note = document.createElement("span");
+    note.className = "aide";
+    note.textContent = "Audio incomplet";
+    actions.appendChild(note);
+  }
+
+  const oublier = document.createElement("button");
+  oublier.type = "button";
+  oublier.className = "lien-bouton";
+  oublier.textContent = "Supprimer";
+  oublier.addEventListener("click", () => oublier_cours(c));
+  actions.appendChild(oublier);
+
+  li.appendChild(titre);
+  li.appendChild(meta);
+  if (c.sans_audio && c.sans_audio.length) {
+    const muettes = document.createElement("span");
+    muettes.className = "aide";
+    muettes.textContent = c.sans_audio.length === 1
+      ? `Diapo ${c.sans_audio[0]} sans audio.`
+      : `Diapos sans audio : ${c.sans_audio.join(", ")}.`;
+    li.appendChild(muettes);
+  }
+  if (c.transcription) {
+    const t = document.createElement("span");
+    t.className = "aide";
+    t.textContent = "Déjà transcrit — " + c.transcription.chemin;
+    li.appendChild(t);
+  }
+  li.appendChild(actions);
+  return li;
+}
+
+function rouvrir_cours(c, bouton) {
+  bouton.disabled = true;
+  bouton.textContent = "Ouverture…";
+  fetch("/api/uness/historique/rouvrir", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cle: c.cle }),
+  }).then((r) => r.json().then((j) => ({ ok: r.ok, j }))).then(({ ok, j }) => {
+    bouton.disabled = false;
+    bouton.textContent = "Rouvrir";
+    if (!ok) { erreur_accueil(j.erreur || "Ce cours n'a pas pu être rouvert."); return; }
+    etat.nom = c.titre || "Cours UNESS";
+    etat.duree = c.duree || 0;
+    etat.chapitres = c.chapitres || [];
+    // Le plan complet vient du serveur : on le demande plutôt que de le
+    // reconstruire à partir de la ligne d'historique, forcément partielle.
+    fetch("/api/uness/chapitres").then((r) => r.json()).then((p) => {
+      etat.chapitres = p.chapitres || [];
+      etat.nom = p.titre || etat.nom;
+      construire_plan(p.sans_audio || []);
+      passer_en_travail();
+      $("#avancement-titre").textContent = "Audio prêt";
+      $("#avancement-detail").textContent =
+        "Ce cours vient du cache : rien n'a été retéléchargé.";
+    });
+  }).catch(() => {
+    bouton.disabled = false;
+    bouton.textContent = "Rouvrir";
+    erreur_accueil("Ce cours n'a pas pu être rouvert.");
+  });
+}
+
+function oublier_cours(c) {
+  if (!confirm(`Supprimer l'audio de « ${c.titre || "ce cours"} » de ton disque ?\n\n` +
+               "La transcription déjà enregistrée dans Documents n'est pas touchée. " +
+               "Le cours sera retéléchargé si tu le redemandes.")) return;
+  fetch("/api/uness/historique/oublier", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cle: c.cle }),
+  }).then((r) => r.json().then((j) => ({ ok: r.ok, j }))).then(({ ok, j }) => {
+    if (!ok) { erreur_accueil(j.erreur || "Suppression impossible."); return; }
+    toast("Cours supprimé du disque.");
+    charger_historique();
+  }).catch(() => erreur_accueil("Suppression impossible."));
+}
+
+function date_humaine(epoch) {
+  const j = Math.floor((Date.now() / 1000 - epoch) / 86400);
+  if (j <= 0) return "aujourd'hui";
+  if (j === 1) return "hier";
+  if (j < 30) return `il y a ${j} jours`;
+  return new Date(epoch * 1000).toLocaleDateString("fr-FR");
 }
 
 function etat_uness() {
@@ -222,9 +432,42 @@ function etat_uness() {
     if (s.domaine) $("#uness-domaine").textContent = s.domaine;
     // Sans fenêtre possible, le repli manuel n'est plus un repli : on l'ouvre.
     if (!s.fenetre) $("#uness-manuel").open = true;
+    afficher_trace(s.trace);
+    charger_historique();
+    suivre_connexion(s.connexion === "ouverte");
     if (!s.cookies) { afficher_session(false, "Non connecté à UNESS"); return; }
     verifier_session();
   }).catch(() => afficher_session(false, "Non connecté à UNESS"));
+}
+
+/* Tant que la fenêtre de connexion est ouverte, on rafraîchit : l'utilisateur
+   doit voir ce que l'application est en train de chercher, plutôt qu'un écran
+   qui ne bouge pas. */
+let suivi_connexion;
+function suivre_connexion(actif) {
+  clearInterval(suivi_connexion);
+  if (!actif) return;
+  suivi_connexion = setInterval(() => {
+    fetch("/api/uness/etat").then((r) => r.json()).then((s) => {
+      afficher_trace(s.trace);
+      if (s.connexion === "ouverte") {
+        // Une phrase qui dit où on en est ; la trace reste sous « Détails ».
+        const phrase = phrase_depuis_trace(s.trace);
+        $("#session-texte").textContent = "Fenêtre de connexion ouverte";
+        const d = $("#session-detail");
+        d.textContent = phrase || "Connecte-toi dans la fenêtre qui vient de s'ouvrir.";
+        d.hidden = false;
+        return;
+      }
+      clearInterval(suivi_connexion);
+      etat.uness.cookies = s.cookies;
+      if (s.cookies) verifier_session();
+      else {
+        afficher_session(false, s.message || "Connexion interrompue");
+        $("#uness-manuel").open = true;
+      }
+    }).catch(() => {});
+  }, 3000);
 }
 
 function verifier_session() {
@@ -271,6 +514,8 @@ $("#uness-connexion").addEventListener("click", () => {
     }
     $("#session-texte").textContent =
       "Connecte-toi dans la fenêtre qui vient de s'ouvrir…";
+    $("#uness-trace").open = true;   // on montre ce que la fenêtre cherche
+    suivre_connexion(true);
   }).catch(() => {
     $("#uness-connexion").disabled = false;
     erreur_accueil("La fenêtre de connexion n'a pas pu s'ouvrir.");
@@ -406,7 +651,11 @@ function maj_uness(e) {
       if (!$("#accueil").hidden) {
         $("#uness-connexion").disabled = false;
         if (e.ok) { etat.uness.cookies = true; verifier_session(); }
-        else { afficher_session(false, e.message); $("#uness-manuel").open = true; }
+        else {
+          afficher_session(false, e.message);
+          $("#uness-manuel").open = true;
+          afficher_trace(e.trace);
+        }
       }
       break;
     case "analyse":
@@ -419,12 +668,16 @@ function maj_uness(e) {
       titre.textContent = "Récupération de l'audio";
       detail.textContent = e.message;
       break;
-    case "audio":
+    case "audio": {
       titre.textContent = "Récupération de l'audio";
-      detail.textContent =
-        `diapo ${e.fait}/${e.total}${e.cache ? " · déjà en cache" : ""}`;
+      const bouts = [`diapo ${e.fait}/${e.total}`];
+      if (e.cache) bouts.push("déjà en cache");
+      if (e.reste_s > 0) bouts.push(`encore ${duree_humaine(e.reste_s)}`);
+      if (e.octets) bouts.push(`${(e.octets / 1048576).toFixed(0)} Mo`);
+      detail.textContent = bouts.join(" · ");
       barre.style.width = (85 * e.fait / Math.max(1, e.total)).toFixed(1) + "%";
       break;
+    }
     case "assemblage":
       titre.textContent = "Assemblage de l'audio";
       detail.textContent = e.total ? `diapo ${e.fait}/${e.total}` : e.message;

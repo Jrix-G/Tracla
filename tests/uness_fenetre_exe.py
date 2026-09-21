@@ -50,7 +50,7 @@ def verifie(nom, condition, detail=""):
     return bool(condition)
 
 
-def scenario(lancement, sso, etiquette):
+def scenario(lancement, sso, etiquette, perd_wantsurl=False, via_moodle=False):
     """Un aller-retour complet de la fenetre de connexion.
 
     'sso=True' fait repondre au faux Moodle une page de connexion qui part
@@ -64,8 +64,11 @@ def scenario(lancement, sso, etiquette):
     travail = tempfile.mkdtemp(prefix="uness-fenetre-")
     profil = os.path.join(travail, "profil")
     sortie = os.path.join(travail, "resultat.json")
-    srv, base = faux_uness.demarrer(nb_diapos=4, sso=sso)
-    url_index = base + "index.htm"
+    srv, base = faux_uness.demarrer(nb_diapos=4, sso=sso,
+                                    perd_wantsurl=perd_wantsurl)
+    # via_moodle : l'adresse que l'utilisateur a dans sa barre d'adresse, la
+    # page de la ressource -- pas celle du lecteur, que personne ne copie.
+    url_index = srv.url_moodle if via_moodle else base + "index.htm"
     # Cas de la PREMIERE connexion : on ne connait encore aucun mp3 (il faut
     # etre identifie pour lire la page qui les liste). La fenetre doit donc en
     # trouver un elle-meme une fois l'utilisateur connecte. C'est le chemin le
@@ -96,8 +99,17 @@ def scenario(lancement, sso, etiquette):
         verifie("le sous-processus tourne toujours (Playwright a demarre)",
                 proc.poll() is None,
                 "code %s" % proc.returncode if proc.poll() is not None else "")
+        # Le fichier existe pendant la recherche (il porte la trace vive) :
+        # ce qui compte est qu'il n'annonce PAS une connexion reussie.
+        partiel = {}
+        if os.path.exists(sortie):
+            try:
+                with open(sortie, encoding="utf-8") as f:
+                    partiel = json.load(f)
+            except Exception:
+                pass
         verifie("une page de connexion en 200 ne vaut PAS une session",
-                not os.path.exists(sortie))
+                partiel.get("ok") is not True, partiel.get("message", ""))
 
         print("\n[2] L'utilisateur se connecte (simule)")
         srv.auto_connexion = True
@@ -157,6 +169,17 @@ def main():
     scenario(lancement, False, "A. Connexion sur une seule origine")
     scenario(lancement, True, "B. SSO : l'onglet reste sur le fournisseur "
                               "d'identite (autre origine)")
+    # Observe sur le vrai UNESS : CAS authentifie, Moodle perd le 'wantsurl'
+    # parce que la cible est un pluginfile.php, et depose l'utilisateur sur le
+    # tableau de bord. La fenetre attendait le cours et cherchait a l'infini.
+    scenario(lancement, True, "C. SSO + Moodle perd le 'wantsurl' : on "
+                              "atterrit sur le tableau de bord",
+             perd_wantsurl=True)
+    # Le cas reel : l'utilisateur colle l'adresse de sa barre d'adresse, qui
+    # est la page Moodle de la ressource. Le lecteur est dedans, dans un cadre.
+    scenario(lancement, True, "D. L'utilisateur colle l'adresse Moodle "
+                              "(mod/resource/view.php?id=...)",
+             perd_wantsurl=True, via_moodle=True)
 
     print("\n%d reussis, %d echoues" % (len(OK), len(KO)))
     if KO:

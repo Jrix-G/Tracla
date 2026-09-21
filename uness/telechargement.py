@@ -70,6 +70,9 @@ class Client:
         self.delai = delai
         self.appliquer_cookies(cookies or [])
         self._dernier = 0.0
+        # Adresse reellement atteinte par le dernier texte() : Moodle redirige
+        # beaucoup, et c'est elle qui sert de base aux liens relatifs.
+        self.derniere_url = None
 
     def appliquer_cookies(self, cookies):
         """cookies : liste de dicts {name, value, domain, path} (format Playwright).
@@ -101,6 +104,7 @@ class Client:
             r = self._get(url, flux=False)
         except ErreurReseau:
             return None
+        self.derniere_url = r.url
         if r.status_code == 404:
             return None
         if r.status_code >= 400:
@@ -204,14 +208,27 @@ class Client:
                            % (url.split("/")[2], derniere))
 
 
+# Une page de connexion, pas une page qui PARLE de connexion.
+#
+# La nuance a l'air subtile et ne l'est pas du tout : une page Moodle ou on
+# est parfaitement connecte contient un en-tete, un pied de page et des liens
+# vers /login/... Chercher "/login/index.php" ou "Se connecter" dans le
+# contenu faisait donc passer la page de cours de l'utilisateur pour une page
+# de connexion, et l'application attendait indefiniment une session qu'elle
+# avait deja. On exige maintenant une vraie marque de formulaire d'identi-
+# fication : un champ de mot de passe, un formulaire qui POSTE vers une page
+# de connexion, ou une redirection d'authentification federee.
 _LOGIN_RE = re.compile(
-    rb"(loginform|/login/index\.php|MoodleSession|mot de passe|password|"
-    rb"identifiez-vous|Se connecter|shibboleth|SAMLRequest)", re.IGNORECASE)
+    rb"""<input[^>]{0,200}type\s*=\s*["']?password"""
+    rb"""|<form[^>]{0,300}action\s*=\s*["'][^"']{0,200}/login/index\.php"""
+    rb"""|SAMLRequest|shibboleth\.sso"""
+    rb"""|class\s*=\s*["'][^"']{0,80}loginform"""
+    rb"""|<title>[^<]{0,80}(?:Connexion|Se connecter|Login)""",
+    re.IGNORECASE)
 
 
 def _page_de_connexion(debut):
-    """Une page HTML qui parle de connexion. Sans ca, on prendrait la vraie
-    page d'erreur de Moodle pour une deconnexion."""
+    """Vrai seulement si la page EST un formulaire d'identification."""
     return bool(_LOGIN_RE.search(debut or b""))
 
 
@@ -223,6 +240,10 @@ class Cache:
     """Un dossier par cours : les mp3 d'origine, l'audio assemble, le plan."""
 
     def __init__(self, racine, cle):
+        # La cle est le nom du dossier : c'est elle que l'historique renvoie a
+        # l'interface pour designer un cours.
+        self.cle = cle
+        self.racine = racine
         self.dossier = os.path.join(racine, cle)
         self.audio = os.path.join(self.dossier, "diapos")
         os.makedirs(self.audio, exist_ok=True)
