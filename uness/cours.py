@@ -6,10 +6,12 @@ fichiers de donnees du lecteur Adobe Presenter, et on ne retombe sur le sondage
 des numeros qu'en dernier recours.
 """
 
+import base64
 import json
 import os
 import re
 import unicodedata
+import zlib
 from urllib.parse import unquote, urljoin, urlparse
 from xml.etree import ElementTree
 
@@ -387,6 +389,99 @@ def _titres_depuis_html(html):
 
 
 # ---------------------------------------------------------------------------
+# Lecteur iSpring
+# ---------------------------------------------------------------------------
+
+# Un cours iSpring n'a ni manifeste ni mp3 lisible dans sa page : tout le plan
+# tient dans une chaine base64 de JSON compresse (zlib), passee au lecteur par
+# `var presInfo = "eNrF..."`. Constate sur le cours 590089 (iSpring 9.7).
+ISPRING_RE = re.compile(r"""presInfo\s*=\s*["']([A-Za-z0-9+/=\s]{16,})["']""")
+ISPRING_MAX = 50 * 1024 * 1024   # garde-fou sur la taille decompressee
+
+
+def _presinfo(html):
+    """Le JSON du lecteur iSpring contenu dans la page, ou None."""
+    m = ISPRING_RE.search(html or "")
+    if not m:
+        return None
+    try:
+        brut = base64.b64decode(re.sub(r"\s+", "", m.group(1)))
+        d = zlib.decompressobj()
+        texte = d.decompress(brut, ISPRING_MAX)
+        donnees = json.loads(texte.decode("utf-8", "replace"))
+    except Exception:
+        return None
+    return donnees if isinstance(donnees, dict) else None
+
+
+def ispring(html):
+    """Plan d'un cours iSpring -> (titre_cours, [{'titre', 'fichier'}...]),
+    ou None si la page n'est pas un lecteur iSpring.
+
+    Trois tables dans le JSON :
+      's'   les diapos, dans l'ordre du cours, avec leur titre ('t') ;
+      'o'   les ressources : {'i': 'sndAsset0', 'h': '<audio><source
+            src="data/sound1.mp3" .../></audio>'} ;
+      'n.a' la narration : chaque piste pointe une ressource ('i') et la
+            diapo ou elle commence ('st.s', indice a partir de 0).
+    Une diapo sans piste reste une diapo, sans audio.
+    """
+    d = _presinfo(html)
+    if not d or not isinstance(d.get("s"), list):
+        return None
+
+    fichiers = {}
+    for o in d.get("o") or []:
+        if isinstance(o, dict):
+            m = MP3_RE.search(str(o.get("h") or ""))
+            if m and o.get("i") is not None:
+                fichiers[o["i"]] = m.group(0).rsplit("/", 1)[-1]
+
+    par_diapo = {}
+    pistes = (d.get("n") or {}).get("a") or []
+    for rang, a in enumerate(pistes):
+        if not isinstance(a, dict) or a.get("i") not in fichiers:
+            continue
+        st = a.get("st") or {}
+        try:
+            n = int(st.get("s"))
+            debut = float(st.get("i") or 0)
+        except (TypeError, ValueError):
+            continue
+        par_diapo.setdefault(n, []).append((debut, rang, fichiers[a["i"]]))
+
+    diapos = []
+    for n, s in enumerate(d["s"]):
+        s = s if isinstance(s, dict) else {}
+        titre = _propre(s.get("t") or "")
+        if not titre:
+            # Titre vide dans le plan : la premiere ligne du texte de la diapo
+            # vaut mieux que rien.
+            titre = _propre((s.get("x") or "").strip().splitlines()[0]
+                            if (s.get("x") or "").strip() else "")
+        sons = [f for _, _, f in sorted(par_diapo.get(n, []))]
+        if not sons:
+            diapos.append({"titre": titre, "fichier": None})
+        # Plusieurs pistes sur une diapo : autant d'entrees, dans l'ordre ou
+        # le lecteur les joue, sous le meme titre.
+        for f in sons:
+            diapos.append({"titre": titre, "fichier": f})
+
+    # Une narration sans aucune piste rattachee (format inattendu) : on garde
+    # au moins les mp3 dans l'ordre des ressources.
+    if not par_diapo and fichiers:
+        diapos = [{"titre": "", "fichier": f} for f in fichiers.values()]
+
+    if not any(x["fichier"] for x in diapos):
+        return None
+
+    titre_cours = _propre(d.get("ct") or d.get("t") or "")
+    if titre_cours.lower() in ("", "index", "presentation", "présentation"):
+        titre_cours = next((x["titre"] for x in diapos if x["titre"]), "")
+    return titre_cours, diapos
+
+
+# ---------------------------------------------------------------------------
 # Decouverte
 # ---------------------------------------------------------------------------
 
@@ -437,6 +532,17 @@ def decouvrir(client, url_index, base, journal=None):
     m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     if m:
         titre_cours = _propre(_desechapper(m.group(1)))
+
+    # -- 0. Lecteur iSpring : le plan est dans la page, compresse -----------
+    plan = ispring(html)
+    if plan:
+        titre_isp, diapos = plan
+        diapos = _ranger(diapos)
+        dire("Lecteur iSpring : %d diapos." % len(diapos))
+        # <title> vaut souvent 'index' sur ces exports.
+        if not titre_cours or titre_cours.lower() == "index":
+            titre_cours = titre_isp
+        return titre_cours, _numeroter(diapos), "iSpring"
 
     # -- 1. Les manifestes connus, plus les scripts reellement charges -------
     candidats = list(MANIFESTES)

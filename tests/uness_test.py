@@ -213,6 +213,47 @@ def test_sondage():
         srv.shutdown()
 
 
+def test_ispring():
+    print("\n[4b] Lecteur iSpring : plan compresse dans presInfo")
+    import base64
+    import json
+    import zlib
+
+    # Forme du cours 590089 : diapos, ressources audio, narration par diapo.
+    # La diapo 3 n'a pas de narration, la 4 en a deux dans le desordre.
+    donnees = {
+        "t": "index",
+        "s": [{"t": "Aspects cliniques de l’asthme"},
+              {"t": "", "x": "EXAMEN DE LA RÉPONSE\r\nSuite"},
+              {"t": "Sans audio"},
+              {"t": "Deux pistes"}],
+        "o": [{"i": "sndAsset%d" % i,
+               "h": '<audio><source src="data/sound%d.mp3" '
+                    'type="audio/mpeg"/></audio>' % (i + 1)}
+              for i in range(4)],
+        "n": {"a": [{"i": "sndAsset0", "st": {"s": 0, "i": 0}},
+                    {"i": "sndAsset1", "st": {"s": 1, "i": 0}},
+                    {"i": "sndAsset3", "st": {"s": 3, "i": 5}},
+                    {"i": "sndAsset2", "st": {"s": 3, "i": 0}}]},
+    }
+    code = base64.b64encode(zlib.compress(
+        json.dumps(donnees).encode("utf-8"))).decode("ascii")
+    html = ('<!-- Created with iSpring --><title>index</title><script>'
+            'var presInfo = "%s";</script>' % code)
+
+    titre, diapos = cours.ispring(html)
+    verifie("titre du cours pris sur la 1re diapo (<title> vaut 'index')",
+            titre == "Aspects cliniques de l’asthme", titre)
+    verifie("mp3 dans l'ordre du cours, deux pistes d'une diapo triees",
+            [d["fichier"] for d in diapos] ==
+            ["sound1.mp3", "sound2.mp3", None, "sound3.mp3", "sound4.mp3"],
+            [d["fichier"] for d in diapos])
+    verifie("titre vide remplace par la 1re ligne du texte",
+            diapos[1]["titre"] == "EXAMEN DE LA RÉPONSE", diapos[1]["titre"])
+    verifie("une page Adobe Presenter n'est pas prise pour iSpring",
+            cours.ispring("<html><script src='data/a24x1.mp3'></script>") is None)
+
+
 def test_telechargement_et_cache(base, cache_racine):
     print("\n[5] Telechargement, diapos sans audio, cache")
     coffre = FauxCoffre(cookies_valides())
@@ -567,7 +608,8 @@ def main():
         test_decouverte(base)
         test_page_moodle(base, cache_racine)
         test_sondage()
-        r = test_telechargement_et_cache(base, cache_racine)
+        test_ispring()
+        r =test_telechargement_et_cache(base, cache_racine)
         test_reprise(base, cache_racine)
         test_retentative(base, cache_racine)
         chapitres = test_assemblage(r)

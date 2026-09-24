@@ -29,6 +29,7 @@ from urllib.parse import urljoin, urlparse
 # un formulaire d'identification, pas une page qui contient un lien vers
 # la page de connexion.
 from .telechargement import _page_de_connexion as _est_page_de_connexion
+from .cours import ispring
 
 ATTENTE_MAX = 15 * 60        # l'utilisateur a 15 min pour se connecter
 DOMAINE = "formation.uness.fr"
@@ -443,6 +444,13 @@ def _trouver_un_mp3(contexte, url, trace=None, page=None):
             return None
         if isinstance(contenu, bytes):
             contenu = contenu.decode("utf-8", "replace")
+        # Lecteur iSpring : les noms des mp3 sont dans un bloc compresse de
+        # la page, invisibles pour une simple recherche de texte.
+        plan = ispring(contenu)
+        if plan:
+            for d in plan[1]:
+                if d["fichier"]:
+                    return base + "data/" + d["fichier"]
         m = _MP3_DANS_TEXTE.search(contenu)
         return base + "data/" + m.group(0).rsplit("/", 1)[-1] if m else None
 
