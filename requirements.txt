@@ -1,5 +1,6 @@
 # Dependances du Transcripteur — versions epinglees.
 # CPU uniquement : aucune dependance CUDA (voir la section GPU du README).
+# Made with love -
 faster-whisper==1.1.1
 ctranslate2==4.8.2
 onnxruntime==1.30.0
